@@ -36,16 +36,20 @@ jobs:
 
       - name: Build Web Version
         run: |
+          mkdir -p /tmp/kepler-path-web
+          cp main.py game.py orbit.py requirements.txt /tmp/kepler-path-web/
+          cp -R assets /tmp/kepler-path-web/assets
+          cd /tmp/kepler-path-web
           python -m pygbag --build --disable-sound-format-error main.py
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: build/web
+          path: /tmp/kepler-path-web/build/web
 
   deploy:
     environment:
-      name: github-pages
+      name: prod
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     needs: build
