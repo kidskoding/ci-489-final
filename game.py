@@ -1,0 +1,1382 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import csv
+import json
+import math
+import queue
+import socket
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import pygame
+
+from orbit import Orbit, Vec2
+
+
+WIDTH = 1024
+HEIGHT = 579
+FPS = 60
+BACKGROUND = (6, 24, 34)
+PANEL = (8, 43, 56)
+PANEL_LIGHT = (113, 232, 235)
+TEXT = (244, 251, 253)
+MUTED = (132, 170, 178)
+ACCENT = (28, 235, 244)
+ORBIT = (168, 191, 206)
+MEASURE = (255, 64, 170)
+PLANET = (70, 167, 255)
+STAR = (252, 196, 25)
+PERI = (76, 217, 100)
+APO = (255, 149, 79)
+FOCUS = (196, 181, 253)
+SHIP_WALL = (87, 110, 182)
+SHIP_SEAM = (255, 65, 169)
+MODAL = (31, 220, 225)
+MODAL_TEXT = (10, 43, 52)
+BUTTON = (83, 178, 185)
+DEFAULT_PORT = 48900
+DISCOVERY_PORT = 48901
+JOIN_CODE = "CI-489-DEMO"
+
+
+ASSET_ROOT = Path(__file__).resolve().parent / "assets"
+EARTH_TEXTURE = ASSET_ROOT / "planets/Earth_4k.png"
+MILKY_WAY_TEXTURE = ASSET_ROOT / "space/milkyway_2048.png"
+
+UI_ASSETS = ASSET_ROOT / "ui"
+SHIP_ASSETS = ASSET_ROOT / "ship"
+PLAYER_ASSETS = ASSET_ROOT / "player"
+
+SHIP_MAP_PATH = SHIP_ASSETS / "map.png"
+PROMPT_PATH = UI_ASSETS / "prompt.png"
+PLAYER_SIDE_PATH = PLAYER_ASSETS / "side"
+PLAYER_IDLE_PATH = PLAYER_SIDE_PATH / "01.png"
+PANEL_BG_PATH = UI_ASSETS / "panel_bg.png"
+FRAME_BG_PATH = UI_ASSETS / "frame_bg.png"
+DIALOG_BG_PATH = UI_ASSETS / "dialog_bg.png"
+TASK_BG_PATH = UI_ASSETS / "task_bg.png"
+KEPLER_PANEL_PATH = UI_ASSETS / "kepler_panel.png"
+
+
+@dataclass
+class Body:
+    name: str
+    pos: Vec2
+    radius: int
+    color: tuple[int, int, int]
+
+
+@dataclass
+class Measurement:
+    start: str
+    end: str
+    distance: float
+    t: float
+    visible: bool = True
+
+
+@dataclass
+class Terminal:
+    name: str
+    rect: pygame.Rect
+    activity: str
+    description: str
+    color: tuple[int, int, int]
+
+
+@dataclass
+class CrewMember:
+    name: str
+    role: str
+    color: tuple[int, int, int]
+    pos: tuple[int, int]
+    joined: bool = False
+    ready: bool = False
+
+
+class NetworkSession:
+    def __init__(self, mode: str = "solo", host: str = "localhost:3000", port: int = DEFAULT_PORT, name: str = "Player") -> None:
+        self.mode = mode
+        self.name = name
+        self.room = JOIN_CODE
+        self.inbox = queue.Queue()
+        self.running = False
+        self.status = "Solo"
+        self.ws = None
+        self.player_names = [name]
+
+        if mode in ["host", "join"]:
+            self.running = True
+            self.status = "Connecting..."
+            # For web, 'host' and 'join' both just connect to the relay server
+            asyncio.create_task(self._ws_loop(host))
+
+    @property
+    def connected(self) -> bool:
+        return self.ws is not None and self.running
+
+    def send(self, message: dict) -> None:
+        if self.mode == "solo" or not self.ws:
+            return
+        payload = json.dumps(message)
+        # We use a non-blocking way to send if possible, or just queue it
+        # For simplicity in this sync-to-async bridge:
+        asyncio.create_task(self.ws.send(payload))
+
+    async def _ws_loop(self, host: str) -> None:
+        import websockets
+        # In browser/pygbag, we can try to get the host from the window location
+        try:
+            import platform
+            window_host = platform.window.location.host
+            if window_host:
+                host = window_host
+        except:
+            pass
+
+        uri = f"ws://{host}"
+        # If running on HTTPS, use wss://
+        try:
+            import platform
+            if platform.window.location.protocol == "https:":
+                uri = f"wss://{host}"
+        except:
+            pass
+        
+        try:
+            async with websockets.connect(uri) as websocket:
+                self.ws = websocket
+                self.status = "Connected"
+                # Join the room
+                await self.ws.send(json.dumps({"type": "join", "room": self.room}))
+                # Identify self
+                await self.ws.send(json.dumps({"type": "hello", "name": self.name}))
+                
+                async for message in websocket:
+                    try:
+                        data = json.loads(message)
+                        self._handle_message(data)
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            self.status = f"Error: {e}"
+            self.running = False
+
+    def _handle_message(self, message: dict) -> None:
+        m_type = message.get("type")
+        if m_type == "hello":
+            name = message.get("name", "Unknown")
+            if name not in self.player_names:
+                self.player_names.append(name)
+            self.inbox.put({"type": "players", "players": self.player_names[:4]})
+        elif m_type == "players":
+            self.player_names = message.get("players", [self.name])
+            self.inbox.put(message)
+        else:
+            self.inbox.put(message)
+
+    def poll(self) -> list[dict]:
+        messages = []
+        while True:
+            try:
+                messages.append(self.inbox.get_nowait())
+            except queue.Empty:
+                return messages
+
+    def close(self) -> None:
+        self.running = False
+        # WS will close when loop ends
+
+
+def discover_host(join_code: str, timeout: float = 1.6) -> str | None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.settimeout(timeout)
+    try:
+        payload = f"HOLOORBIT_DISCOVER:{join_code}".encode("utf-8")
+        sock.sendto(payload, ("255.255.255.255", DISCOVERY_PORT))
+        data, addr = sock.recvfrom(1024)
+    except OSError:
+        return None
+    finally:
+        sock.close()
+    text = data.decode("utf-8", errors="ignore")
+    if text.startswith(f"HOLOORBIT_HOST:{join_code}:"):
+        return addr[0]
+    return None
+
+
+class KeplerGame:
+    def __init__(self, multiplayer_mode: str = "solo", host: str = "127.0.0.1", port: int = DEFAULT_PORT, player_name: str = "Player") -> None:
+        pygame.init()
+        pygame.display.set_caption("Kepler Path - Pygame")
+        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont("arial", 22)
+        self.small = pygame.font.SysFont("arial", 16)
+        self.micro = pygame.font.SysFont("arial", 12, bold=True)
+        self.title = pygame.font.SysFont("arial", 28, bold=True)
+        self.heading = pygame.font.SysFont("arial", 34, bold=True)
+        self.orbit = Orbit()
+        self.center = Vec2(380, 284)
+        self.zoom = 0.7
+        self.rotation = 0.0
+        self.t = 0.0
+        self.paused = False
+        self.menu_active = multiplayer_mode == "menu"
+        self.menu_mode = "name" if self.menu_active else "choose"
+        self.pending_menu_mode = "choose"
+        self.player_name_input = ""
+        self.join_ip = ""
+        self.menu_input_focused = False
+        self.local_ip = self.detect_local_ip()
+        self.screen_state = "ship"
+        self.mode = "play"
+        self.selected: str | None = None
+        self.measurements: list[Measurement] = []
+        self.notice = "You and your team must work together to find a secret code that unlocks the doors in the ship. Move with WASD and press E at a console."
+        self.background = self.load_background()
+        self.planet_texture = self.load_planet_texture()
+        self.ship_map = self.load_scaled(SHIP_MAP_PATH, (WIDTH, HEIGHT))
+        self.prompt_icon = self.load_scaled(PROMPT_PATH, (66, 66))
+        self.player_idle = self.load_scaled(PLAYER_IDLE_PATH, (52, 44))
+
+        self.panel_bg = self.load_scaled(PANEL_BG_PATH, (282, HEIGHT - 112))
+        self.frame_bg = self.load_scaled(FRAME_BG_PATH, (704, 394))
+        self.dialog_bg = self.load_scaled(DIALOG_BG_PATH, (910, 122))
+        self.task_bg = self.load_scaled(TASK_BG_PATH, (248, 34))
+        self.kepler_panel = self.load_scaled(KEPLER_PANEL_PATH, (248, 170))
+        self.player = pygame.Vector2(279, 148)
+        self.player_speed = 230.0
+        self.player_facing = "left"
+        self.interact_target: Terminal | None = None
+        self.active_terminal = "Navigation Bay"
+        self.transition_timer = 0.0
+        self.transition_label = ""
+        self.measure_flash = 0.0
+        self.multiplayer_timer = 0.0
+        self.exit_menu_active = False
+        self.position_sync_timer = 0.0
+        self.team_code = JOIN_CODE
+        self.network = NetworkSession(multiplayer_mode, host, port, player_name)
+        self.crew = [
+            CrewMember(player_name, "Navigator", ACCENT, (279, 148), joined=True, ready=True),
+            CrewMember("Waiting", "Recorder", (244, 114, 182), (906, 336)),
+            CrewMember("Waiting", "Pilot", (76, 217, 100), (676, 236)),
+            CrewMember("Waiting", "Observer", (252, 196, 25), (104, 336)),
+        ]
+        self.terminals = [
+            Terminal(
+                "Crew Lounge",
+                pygame.Rect(158, 344, 92, 76),
+                "lounge",
+                "Gather here with your crew and press E when you are ready.",
+                (56, 189, 248),
+            ),
+            Terminal(
+                "Mars Observe",
+                pygame.Rect(312, 142, 144, 86),
+                "observe",
+                "Inspect orbital relationships and prior observations.",
+                (168, 85, 247),
+            ),
+            Terminal(
+                "Mars Measure",
+                pygame.Rect(678, 324, 146, 86),
+                "measure",
+                "Measure distances between the star, planet, foci, and apsides.",
+                (244, 114, 182),
+            ),
+            Terminal(
+                "Navigation Bay",
+                pygame.Rect(312, 318, 160, 122),
+                "ship",
+                "Return to the crew navigation map.",
+                (76, 217, 100),
+            ),
+        ]
+        self.running = True
+
+    def detect_local_ip(self) -> str:
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.connect(("8.8.8.8", 80))
+            ip = probe.getsockname()[0]
+            probe.close()
+            return ip
+        except OSError:
+            return "127.0.0.1"
+
+    def start_host_game(self) -> None:
+        self.network.close()
+        name = self.player_name_input.strip() or self.crew[0].name
+        name = "Host" if name == "Player" else name
+        self.crew[0].name = name
+        self.network = NetworkSession("host", "127.0.0.1", DEFAULT_PORT, name)
+        self.menu_active = False
+        self.reset_presentation()
+        self.notice = f"Hosting team {self.team_code}. Share IP {self.local_ip} with players."
+
+    def start_join_game(self) -> None:
+        code_or_host = self.join_ip.strip()
+        if not code_or_host:
+            return
+        if code_or_host.upper() == JOIN_CODE:
+            host = discover_host(JOIN_CODE) or "127.0.0.1"
+        else:
+            host = code_or_host
+        self.network.close()
+        name = self.player_name_input.strip() or self.crew[0].name
+        name = "Visitor" if name == "Player" else name
+        self.crew[0].name = name
+        self.network = NetworkSession("join", host, DEFAULT_PORT, name)
+        self.menu_active = False
+        self.reset_presentation()
+        self.notice = f"Joining team {self.team_code}."
+
+    def terminal_named(self, name: str) -> Terminal:
+        for terminal in self.terminals:
+            if terminal.name == name:
+                return terminal
+        raise ValueError(f"unknown terminal: {name}")
+
+    def sync_crew_names(self, names: list[str]) -> None:
+        roles = ["Navigator", "Recorder", "Pilot", "Observer"]
+        colors = [ACCENT, (244, 114, 182), (76, 217, 100), (252, 196, 25)]
+        for i, member in enumerate(self.crew):
+            if i < len(names):
+                was_ready = member.ready
+                member.name = names[i]
+                member.role = roles[i]
+                member.color = colors[i]
+                member.joined = True
+                member.ready = was_ready
+            else:
+                member.name = "Waiting"
+                member.role = roles[i]
+                member.color = colors[i]
+                member.joined = False
+                member.ready = False
+
+    def crew_member_by_name(self, name: str) -> CrewMember | None:
+        for member in self.crew:
+            if member.name == name:
+                return member
+        return None
+
+    def local_crew_member(self) -> CrewMember:
+        member = self.crew_member_by_name(self.network.name)
+        return member if member is not None else self.crew[0]
+
+    def joined_crew(self) -> list[CrewMember]:
+        return [member for member in self.crew if member.joined]
+
+    def all_joined_ready(self) -> bool:
+        joined = self.joined_crew()
+        return bool(joined) and all(member.ready for member in joined)
+
+    def apply_network_messages(self) -> None:
+        for message in self.network.poll():
+            message_type = message.get("type")
+            if message_type == "players":
+                players = [str(name) for name in message.get("players", [])]
+                self.sync_crew_names(players[:4])
+            elif message_type == "open_terminal":
+                name = str(message.get("terminal", "Mars Measure"))
+                try:
+                    self.open_terminal(self.terminal_named(name), broadcast=False)
+                except ValueError:
+                    pass
+            elif message_type == "measurement":
+                start = str(message.get("start", "Red Dwarf"))
+                end = str(message.get("end", "Perihelion"))
+                t = float(message.get("t", self.t))
+                distance = float(message.get("distance", self.distance_between(start, end, t)))
+                if not any(m.start == start and m.end == end and abs(m.t - t) < 0.0001 for m in self.measurements):
+                    self.measurements.append(Measurement(start, end, distance, t))
+                    self.measure_flash = 1.2
+                    self.notice = f"Team recorded {start} to {end}: {distance:.1f} units."
+            elif message_type == "return_ship":
+                self.screen_state = "ship"
+                self.active_terminal = "Navigation Bay"
+                self.selected = None
+                self.notice = "Team returned to the Navigation Bay."
+            elif message_type == "player_pos":
+                name = str(message.get("name", ""))
+                if name == self.network.name:
+                    continue
+                member = self.crew_member_by_name(name)
+                if member is not None:
+                    member.pos = (int(message.get("x", member.pos[0])), int(message.get("y", member.pos[1])))
+                    member.joined = True
+            elif message_type == "ready":
+                member = self.crew_member_by_name(str(message.get("name", "")))
+                if member is not None:
+                    member.ready = bool(message.get("ready", True))
+
+    def load_background(self) -> pygame.Surface | None:
+        if not MILKY_WAY_TEXTURE.exists():
+            return None
+        image = pygame.image.load(str(MILKY_WAY_TEXTURE)).convert()
+        return pygame.transform.smoothscale(image, (WIDTH, HEIGHT))
+
+    def load_planet_texture(self) -> pygame.Surface | None:
+        if not EARTH_TEXTURE.exists():
+            return None
+        image = pygame.image.load(str(EARTH_TEXTURE)).convert_alpha()
+        return pygame.transform.smoothscale(image, (34, 34))
+
+    def load_scaled(self, path: Path, size: tuple[int, int]) -> pygame.Surface | None:
+        if not path.exists():
+            return None
+        image = pygame.image.load(str(path)).convert_alpha()
+        return pygame.transform.smoothscale(image, size)
+
+    def load_player_walk(self) -> list[pygame.Surface]:
+        frames = []
+        for i in range(1, 15):
+            path = PLAYER_SIDE_PATH / f"{i:02}.png"
+            frame = self.load_scaled(path, (52, 44))
+            if frame is not None:
+                frames.append(frame)
+        return frames
+
+    def draw_glow_rect(
+        self,
+        rect: pygame.Rect,
+        fill: tuple[int, int, int],
+        border: tuple[int, int, int] = PANEL_LIGHT,
+        radius: int = 14,
+        alpha: int = 235,
+        width: int = 2,
+    ) -> None:
+        shadow = pygame.Surface((rect.width + 18, rect.height + 18), pygame.SRCALPHA)
+        pygame.draw.rect(shadow, (*border, 46), shadow.get_rect(), border_radius=radius + 9)
+        self.screen.blit(shadow, (rect.x - 9, rect.y - 9))
+        surface = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(surface, (*fill, alpha), surface.get_rect(), border_radius=radius)
+        pygame.draw.rect(surface, border, surface.get_rect(), width, border_radius=radius)
+        self.screen.blit(surface, rect)
+
+    def draw_wrapped(
+        self,
+        text: str,
+        font: pygame.font.Font,
+        color: tuple[int, int, int],
+        rect: pygame.Rect,
+        line_gap: int = 4,
+    ) -> None:
+        words = text.split()
+        x, y = rect.topleft
+        line = ""
+        for word in words:
+            test = f"{line} {word}".strip()
+            if font.size(test)[0] <= rect.width or not line:
+                line = test
+                continue
+            self.screen.blit(font.render(line, True, color), (x, y))
+            y += font.get_linesize() + line_gap
+            line = word
+            if y > rect.bottom - font.get_linesize():
+                return
+        if line and y <= rect.bottom - font.get_linesize():
+            self.screen.blit(font.render(line, True, color), (x, y))
+
+    def draw_objective(self, text: str) -> None:
+        rect = pygame.Rect(18, 16, 338, 52)
+        self.draw_glow_rect(rect, PANEL, ACCENT, radius=10, alpha=238, width=1)
+        prefix = self.micro.render("OBJECTIVE:", True, ACCENT)
+        self.screen.blit(prefix, (30, 25))
+        self.draw_wrapped(text, self.small, ACCENT, pygame.Rect(106, 22, 236, 40), line_gap=0)
+
+    def draw_nav_badge(self) -> None:
+        center = (978, 38)
+        pygame.draw.circle(self.screen, ACCENT, center, 28, 2)
+        pygame.draw.circle(self.screen, (5, 32, 42), center, 22)
+        pygame.draw.line(self.screen, ACCENT, (center[0] - 16, center[1]), (center[0] + 16, center[1]), 2)
+        pygame.draw.line(self.screen, ACCENT, (center[0], center[1] - 16), (center[0], center[1] + 16), 2)
+        pygame.draw.polygon(
+            self.screen,
+            ACCENT,
+            [(center[0], center[1] - 14), (center[0] + 8, center[1] + 4), (center[0], center[1]), (center[0] - 8, center[1] + 4)],
+        )
+
+    def draw_dialog(self, speaker: str, message: str, compact: bool = False) -> None:
+        if compact:
+            outer = pygame.Rect(42, HEIGHT - 104, WIDTH - 84, 78)
+        else:
+            outer = pygame.Rect(38, HEIGHT - 150, WIDTH - 76, 124)
+        pygame.draw.rect(self.screen, TEXT, outer, border_radius=28)
+        inner = outer.inflate(-20 if compact else -24, -14 if compact else -20)
+        self.draw_glow_rect(inner, PANEL, PANEL_LIGHT, radius=24, alpha=250, width=1)
+        if speaker:
+            tag = self.small.render(speaker.upper(), True, ACCENT)
+            self.screen.blit(tag, (inner.x + 24, inner.y + (8 if compact else 17)))
+            text_rect = pygame.Rect(
+                inner.x + 24,
+                inner.y + (32 if compact else 44),
+                inner.width - (116 if compact else 142),
+                inner.height - (38 if compact else 54),
+            )
+        else:
+            text_rect = pygame.Rect(inner.x + 24, inner.y + 24, inner.width - 142, inner.height - 40)
+        self.draw_wrapped(message, self.small if compact else self.font, TEXT, text_rect, line_gap=1 if compact else 2)
+        arrow_x = inner.right - (56 if compact else 78)
+        arrow_y = inner.centery
+        arrow_h = 30 if compact else 42
+        arrow_w = 22 if compact else 30
+        pygame.draw.polygon(
+            self.screen,
+            (221, 255, 255),
+            [(arrow_x - 18, arrow_y - arrow_h), (arrow_x + arrow_w, arrow_y), (arrow_x - 18, arrow_y + arrow_h), (arrow_x - 5, arrow_y)],
+        )
+        pygame.draw.polygon(
+            self.screen,
+            (98, 242, 248),
+            [(arrow_x - 14, arrow_y - arrow_h + 8), (arrow_x + arrow_w - 8, arrow_y), (arrow_x - 14, arrow_y + arrow_h - 8), (arrow_x - 5, arrow_y)],
+            2,
+        )
+
+    def draw_transition_modal(self) -> None:
+        if self.transition_timer <= 0:
+            return
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((238, 242, 244, 178))
+        self.screen.blit(overlay, (0, 0))
+        rect = pygame.Rect(160, 110, 704, 360)
+        surface = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(surface, (*MODAL, 224), surface.get_rect(), border_radius=14)
+        self.screen.blit(surface, rect)
+        close = self.title.render("x", True, MODAL_TEXT)
+        self.screen.blit(close, (rect.right - 42, rect.y + 18))
+        message = self.transition_label or "Waiting for other players to join the meeting!"
+        lines = pygame.Rect(rect.x + 92, rect.y + 142, rect.width - 184, 110)
+        self.draw_wrapped(message, self.heading, MODAL_TEXT, lines, line_gap=2)
+        joined = sum(member.joined for member in self.crew)
+        ready = sum(member.ready for member in self.crew)
+        status = self.small.render(f"Team {self.team_code}  |  {joined}/{len(self.crew)} joined  |  {ready}/{len(self.crew)} ready", True, MODAL_TEXT)
+        self.screen.blit(status, status.get_rect(center=(rect.centerx, rect.y + 262)))
+        pygame.draw.circle(self.screen, STAR, (rect.right - 68, rect.bottom - 50), 20)
+
+    def draw_crew_status(self, rect: pygame.Rect) -> None:
+        self.draw_glow_rect(rect, PANEL, PANEL_LIGHT, radius=12, alpha=236, width=1)
+        header = f"TEAM {self.team_code}"
+        if self.network.mode == "host":
+            header = f"HOSTING {self.team_code}"
+        elif self.network.mode == "join":
+            header = f"JOINED {self.team_code}"
+        self.screen.blit(self.small.render(header, True, ACCENT), (rect.x + 16, rect.y + 14))
+        y = rect.y + 42
+        for member in self.crew:
+            pygame.draw.circle(self.screen, member.color if member.joined else MUTED, (rect.x + 23, y + 9), 6)
+            name = member.name.upper()
+            self.screen.blit(self.micro.render(name, True, TEXT if member.joined else MUTED), (rect.x + 38, y + 2))
+            state = "READY" if member.ready else ("JOINED" if member.joined else "WAITING")
+            state_color = ACCENT if member.ready else MUTED
+            state_text = self.micro.render(state, True, state_color)
+            self.screen.blit(state_text, (rect.right - state_text.get_width() - 14, y + 2))
+            y += 23
+
+    def draw_start_menu(self) -> None:
+        self.screen.fill((194, 199, 204))
+        if self.ship_map:
+            self.screen.blit(self.ship_map, (0, 0))
+            overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            overlay.fill((4, 16, 22, 142))
+            self.screen.blit(overlay, (0, 0))
+
+        panel = pygame.Rect(236, 94, 552, 390)
+        self.draw_glow_rect(panel, PANEL, PANEL_LIGHT, radius=18, alpha=248, width=2)
+        title = self.heading.render("HOLOORBITS", True, TEXT)
+        self.screen.blit(title, title.get_rect(center=(panel.centerx, panel.y + 58)))
+        subtitle = self.small.render(f"Team Code: {self.team_code}", True, ACCENT)
+        self.screen.blit(subtitle, subtitle.get_rect(center=(panel.centerx, panel.y + 96)))
+
+        if self.menu_mode == "name":
+            input_rect = pygame.Rect(panel.x + 82, panel.y + 166, panel.width - 164, 54)
+            self.draw_glow_rect(input_rect, (16, 64, 76), ACCENT if self.menu_input_focused else MUTED, radius=10, alpha=245, width=1)
+            value = self.player_name_input if self.player_name_input else "Type your name"
+            color = TEXT if self.player_name_input else MUTED
+            name_text = self.title.render(value, True, color)
+            self.screen.blit(name_text, name_text.get_rect(center=input_rect.center))
+            if self.menu_input_focused and pygame.time.get_ticks() % 1000 < 520:
+                name_width = self.title.size(self.player_name_input)[0] if self.player_name_input else 0
+                cursor_x = input_rect.centerx + (name_width // 2 + 4 if self.player_name_input else 0)
+                pygame.draw.line(self.screen, TEXT, (cursor_x, input_rect.y + 13), (cursor_x, input_rect.bottom - 13), 2)
+            continue_rect = pygame.Rect(panel.x + 82, panel.y + 248, panel.width - 164, 62)
+            self.draw_glow_rect(continue_rect, BUTTON, PANEL_LIGHT, radius=14, alpha=245, width=2)
+            continue_text = self.title.render("CONTINUE", True, TEXT)
+            self.screen.blit(continue_text, continue_text.get_rect(center=continue_rect.center))
+            hint = self.micro.render("Press Enter or click Continue.", True, MUTED)
+            self.screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.y + 338)))
+            footer = self.micro.render("Press Esc to quit.", True, MUTED)
+            self.screen.blit(footer, footer.get_rect(center=(panel.centerx, panel.bottom - 28)))
+            return
+
+        host_rect = pygame.Rect(panel.x + 82, panel.y + 142, panel.width - 164, 62)
+        join_rect = pygame.Rect(panel.x + 82, panel.y + 224, panel.width - 164, 62)
+        self.draw_glow_rect(host_rect, BUTTON, PANEL_LIGHT, radius=14, alpha=245, width=2)
+        self.draw_glow_rect(join_rect, PANEL if self.menu_mode == "join" else BUTTON, PANEL_LIGHT, radius=14, alpha=245, width=2)
+        host_text = self.title.render("HOST GAME", True, TEXT)
+        join_text = self.title.render("JOIN GAME", True, TEXT)
+        self.screen.blit(host_text, host_text.get_rect(center=host_rect.center))
+        self.screen.blit(join_text, join_text.get_rect(center=join_rect.center))
+
+        if self.menu_mode == "join":
+            input_rect = pygame.Rect(panel.x + 82, panel.y + 306, panel.width - 164, 42)
+            self.draw_glow_rect(input_rect, (16, 64, 76), ACCENT if self.menu_input_focused else MUTED, radius=10, alpha=245, width=1)
+            value = self.join_ip if self.join_ip else f"Type {JOIN_CODE}, then Enter"
+            color = TEXT if self.join_ip else MUTED
+            text_surface = self.small.render(value, True, color)
+            self.screen.blit(text_surface, (input_rect.x + 16, input_rect.y + 12))
+            if self.menu_input_focused and pygame.time.get_ticks() % 1000 < 520:
+                cursor_x = input_rect.x + 18 + (self.small.size(self.join_ip)[0] if self.join_ip else 0)
+                pygame.draw.line(self.screen, TEXT, (cursor_x, input_rect.y + 10), (cursor_x, input_rect.bottom - 10), 2)
+        else:
+            hint = self.small.render(f"Host IP: {self.local_ip}", True, MUTED)
+            self.screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.y + 328)))
+
+        footer = self.micro.render("Click a button. Press Esc to quit.", True, MUTED)
+        self.screen.blit(footer, footer.get_rect(center=(panel.centerx, panel.bottom - 28)))
+
+    def draw_remote_crew(self) -> None:
+        for member in self.crew:
+            if not member.joined:
+                continue
+            if member.name == self.network.name:
+                continue
+            px, py = member.pos
+            pygame.draw.ellipse(self.screen, (0, 0, 0, 82), (px - 16, py + 11, 32, 9))
+            pygame.draw.rect(self.screen, member.color, (px - 10, py - 20, 20, 28), border_radius=5)
+            pygame.draw.circle(self.screen, (245, 249, 252), (px, py - 28), 10)
+            visor = pygame.Rect(px - 8, py - 32, 16, 8)
+            pygame.draw.rect(self.screen, PANEL, visor, border_radius=4)
+            pygame.draw.circle(self.screen, ACCENT, (px - 4, py - 28), 2)
+            pygame.draw.circle(self.screen, ACCENT, (px + 4, py - 28), 2)
+            self.draw_nameplate(member.name, member.color, px, py)
+
+    def draw_nameplate(self, name: str, color: tuple[int, int, int], px: int, py: int) -> None:
+        label = self.micro.render(name.upper(), True, TEXT)
+        label_rect = label.get_rect(center=(px, py + 28)).inflate(12, 6)
+        pygame.draw.rect(self.screen, PANEL, label_rect, border_radius=5)
+        pygame.draw.rect(self.screen, color, label_rect, 1, border_radius=5)
+        self.screen.blit(label, label.get_rect(center=label_rect.center))
+
+    def world_to_screen(self, point: Vec2) -> tuple[int, int]:
+        rotated = point.rotate(self.rotation)
+        scaled = rotated * self.zoom
+        return round(self.center.x + scaled.x), round(self.center.y - scaled.y)
+
+    def screen_to_world(self, pos: tuple[int, int]) -> Vec2:
+        x = (pos[0] - self.center.x) / self.zoom
+        y = -(pos[1] - self.center.y) / self.zoom
+        return Vec2(x, y).rotate(-self.rotation)
+
+    def bodies(self) -> dict[str, Body]:
+        planet = self.orbit.point_at(self.t)
+        return {
+            "Red Dwarf": Body("Red Dwarf", Vec2(0, 0), 24, STAR),
+            "Perihelion": Body("Perihelion", Vec2(self.orbit.periapsis, 0), 10, PERI),
+            "Aphelion": Body("Aphelion", Vec2(-self.orbit.apoapsis, 0), 10, APO),
+            "Focus": Body("Focus", Vec2(self.orbit.periapsis - self.orbit.apoapsis, 0), 9, FOCUS),
+            "Exoplanet": Body("Exoplanet", planet, 17, PLANET),
+        }
+
+    def body_at(self, mouse_pos: tuple[int, int]) -> str | None:
+        for body in sorted(self.bodies().values(), key=lambda b: b.radius, reverse=True):
+            sx, sy = self.world_to_screen(body.pos)
+            if math.hypot(mouse_pos[0] - sx, mouse_pos[1] - sy) <= body.radius + 8:
+                return body.name
+        return None
+
+    def body_position_at_measurement(self, name: str, t: float) -> Vec2:
+        if name == "Exoplanet":
+            return self.orbit.point_at(t)
+        return self.bodies()[name].pos
+
+    def distance_between(self, start: str, end: str, t: float) -> float:
+        start_pos = self.body_position_at_measurement(start, t)
+        end_pos = self.body_position_at_measurement(end, t)
+        return (start_pos - end_pos).length()
+
+    def open_terminal(self, terminal: Terminal, broadcast: bool = True) -> None:
+        if terminal.activity == "ship":
+            self.screen_state = "ship"
+            self.active_terminal = "Navigation Bay"
+            self.selected = None
+            self.notice = "Interact with a door to find your fragment of the code."
+            return
+        if terminal.activity == "lounge":
+            local_member = self.local_crew_member()
+            local_member.joined = True
+            local_member.ready = not local_member.ready
+            if self.network.mode == "solo":
+                for member in self.crew:
+                    member.joined = True
+                    member.ready = True
+                local_member.ready = True
+            else:
+                self.network.send({"type": "ready", "name": self.network.name, "ready": local_member.ready})
+            ready = sum(member.ready for member in self.joined_crew())
+            total = len(self.joined_crew())
+            status = "ready" if local_member.ready else "not ready"
+            self.notice = f"Crew Lounge: {ready}/{total} crew ready. You are {status}."
+            return
+        if self.network.mode != "solo" and not self.all_joined_ready():
+            ready = sum(member.ready for member in self.joined_crew())
+            total = len(self.joined_crew())
+            self.notice = f"Gather at the Crew Lounge first. {ready}/{total} crew ready."
+            return
+        if terminal.activity != "ship" and self.network.mode == "solo":
+            for member in self.crew:
+                if member.joined:
+                    member.ready = True
+        self.interact_target = terminal
+        self.active_terminal = terminal.name
+        self.mode = terminal.activity
+        self.screen_state = "orbit"
+        self.selected = None
+        self.transition_timer = 0.75
+        self.multiplayer_timer = 0.0
+        for i, member in enumerate(self.crew):
+            if self.network.mode == "solo":
+                member.joined = True
+                member.ready = True
+            else:
+                member.ready = False
+        self.transition_label = "Waiting for other players to join the meeting!"
+        self.notice = f"{terminal.name}: {terminal.description}"
+        if broadcast:
+            self.network.send({"type": "open_terminal", "terminal": terminal.name})
+
+    def run_demo_step(self) -> None:
+        if self.screen_state == "ship":
+            terminal = self.terminal_named("Mars Measure")
+            self.player.update(terminal.rect.centerx, terminal.rect.centery + 50)
+            self.open_terminal(terminal)
+            return
+
+        self.mode = "measure"
+        self.selected = None
+        if not self.measurements:
+            measurement_t = self.t
+            distance = self.distance_between("Red Dwarf", "Perihelion", measurement_t)
+            self.measurements.append(Measurement("Red Dwarf", "Perihelion", distance, measurement_t))
+            self.measure_flash = 1.2
+            for member in self.crew:
+                member.joined = True
+                member.ready = True
+            self.network.send({
+                "type": "measurement",
+                "start": "Red Dwarf",
+                "end": "Perihelion",
+                "distance": distance,
+                "t": measurement_t,
+            })
+            self.notice = f"Recorded Red Dwarf to Perihelion: {distance:.1f} units."
+            return
+
+        self.screen_state = "ship"
+        self.active_terminal = "Navigation Bay"
+        self.selected = None
+        self.transition_timer = 0.55
+        self.transition_label = "Returning to the Navigation Bay."
+        self.network.send({"type": "return_ship"})
+        self.notice = "Fragment recorded. Return to the Navigation Bay and choose the next console."
+
+    def reset_presentation(self) -> None:
+        self.screen_state = "ship"
+        self.mode = "play"
+        self.active_terminal = "Navigation Bay"
+        self.selected = None
+        self.measurements.clear()
+        self.t = 0.0
+        self.paused = False
+        self.transition_timer = 0.0
+        self.measure_flash = 0.0
+        self.multiplayer_timer = 0.0
+        self.player.update(279, 148)
+        self.interact_target = None
+        for i, member in enumerate(self.crew):
+            if self.network.mode == "solo":
+                member.joined = i == 0
+                member.ready = i == 0
+            else:
+                member.ready = member.joined
+        self.notice = "You and your team must work together to find a secret code that unlocks the doors in the ship. Move with WASD and press E at a console."
+
+    def handle_key(self, event: pygame.event.Event) -> None:
+        if self.menu_active:
+            if event.key == pygame.K_ESCAPE and self.menu_mode == "join":
+                self.menu_mode = "choose"
+                self.menu_input_focused = False
+            elif event.key == pygame.K_ESCAPE:
+                self.running = False
+            else:
+                self.handle_menu_key(event)
+            return
+        if event.key == pygame.K_F5 or (event.key == pygame.K_d and event.mod & pygame.KMOD_SHIFT):
+            self.run_demo_step()
+        elif event.key == pygame.K_0 or event.key == pygame.K_HOME:
+            self.reset_presentation()
+        elif self.screen_state == "ship":
+            if event.key == pygame.K_ESCAPE:
+                self.running = False
+            else:
+                self.handle_ship_key(event)
+        elif event.key == pygame.K_e:
+            member = self.local_crew_member()
+            member.ready = not member.ready
+            self.network.send({"type": "ready", "name": self.network.name, "ready": member.ready})
+            status = "READY" if member.ready else "WAITING"
+            self.notice = f"You are {status} to return to ship. Click the nav icon to toggle the status panel."
+        elif event.key == pygame.K_SPACE:
+            self.paused = not self.paused
+        elif event.key == pygame.K_m:
+            self.mode = "measure"
+            self.selected = None
+            self.notice = "Measure mode: click two bodies to record distance."
+        elif event.key == pygame.K_o:
+            self.mode = "observe"
+            self.selected = None
+            self.notice = "Observe mode: inspect labels and prior measurements."
+        elif event.key == pygame.K_p:
+            self.mode = "play"
+            self.selected = None
+            self.notice = "Play mode: orbit animation is active."
+        elif event.key == pygame.K_r:
+            self.t = 0.0
+            self.measurements.clear()
+            self.selected = None
+            self.notice = "Reset orbit and measurements."
+        elif event.key == pygame.K_s:
+            self.save_measurements()
+        elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
+            self.zoom = min(1.7, self.zoom + 0.08)
+        elif event.key == pygame.K_MINUS:
+            self.zoom = max(0.55, self.zoom - 0.08)
+        elif event.key == pygame.K_LEFT:
+            self.rotation -= 0.08
+        elif event.key == pygame.K_RIGHT:
+            self.rotation += 0.08
+        elif event.key == pygame.K_BACKSPACE and self.measurements:
+            self.measurements.pop()
+            self.notice = "Deleted latest measurement."
+
+    def handle_menu_key(self, event: pygame.event.Event) -> None:
+        if event.key == pygame.K_ESCAPE:
+            self.running = False
+            return
+        if self.menu_mode == "name":
+            if event.key == pygame.K_RETURN:
+                if self.player_name_input.strip():
+                    self.crew[0].name = self.player_name_input.strip()
+                    self.menu_mode = "choose"
+                    self.menu_input_focused = False
+            elif not self.menu_input_focused:
+                return
+            elif event.key == pygame.K_BACKSPACE:
+                self.player_name_input = self.player_name_input[:-1]
+            elif event.unicode and (event.unicode.isalnum() or event.unicode in " _-"):
+                if len(self.player_name_input) < 12:
+                    self.player_name_input += event.unicode
+            return
+        if self.menu_mode == "choose":
+            if event.key == pygame.K_h:
+                self.start_host_game()
+            elif event.key == pygame.K_j:
+                self.menu_mode = "join"
+                self.menu_input_focused = True
+            return
+        if self.menu_mode == "join":
+            if event.key == pygame.K_RETURN:
+                self.start_join_game()
+            elif event.key == pygame.K_ESCAPE:
+                self.menu_mode = "choose"
+                self.menu_input_focused = False
+            elif not self.menu_input_focused:
+                return
+            elif event.key == pygame.K_BACKSPACE:
+                self.join_ip = self.join_ip[:-1]
+            elif event.unicode and (event.unicode.isalnum() or event.unicode in ".-"):
+                self.join_ip += event.unicode.upper()
+
+    def handle_ship_key(self, event: pygame.event.Event) -> None:
+        if event.key == pygame.K_e:
+            if self.interact_target is None:
+                self.notice = "Move closer to a console, then press E."
+                return
+            if self.interact_target.activity == "ship":
+                self.notice = "Already in the Navigation Bay."
+                return
+            self.open_terminal(self.interact_target)
+
+    def handle_click(self, pos: tuple[int, int]) -> None:
+        if self.menu_active:
+            panel = pygame.Rect(236, 94, 552, 390)
+            if self.menu_mode == "name":
+                input_rect = pygame.Rect(panel.x + 82, panel.y + 166, panel.width - 164, 54)
+                continue_rect = pygame.Rect(panel.x + 82, panel.y + 248, panel.width - 164, 62)
+                if input_rect.collidepoint(pos):
+                    self.menu_input_focused = True
+                elif continue_rect.collidepoint(pos) and self.player_name_input.strip():
+                    self.crew[0].name = self.player_name_input.strip()
+                    self.menu_mode = "choose"
+                    self.menu_input_focused = False
+                else:
+                    self.menu_input_focused = False
+                return
+            host_rect = pygame.Rect(panel.x + 82, panel.y + 142, panel.width - 164, 62)
+            join_rect = pygame.Rect(panel.x + 82, panel.y + 224, panel.width - 164, 62)
+            join_input_rect = pygame.Rect(panel.x + 82, panel.y + 306, panel.width - 164, 42)
+            if host_rect.collidepoint(pos):
+                self.start_host_game()
+            elif join_rect.collidepoint(pos):
+                if self.menu_mode == "join" and self.join_ip.strip():
+                    self.start_join_game()
+                else:
+                    self.menu_mode = "join"
+                    self.menu_input_focused = True
+            elif self.menu_mode == "join" and join_input_rect.collidepoint(pos):
+                self.menu_input_focused = True
+            else:
+                self.menu_input_focused = False
+            return
+        if self.screen_state == "ship":
+            for terminal in self.terminals:
+                if terminal.rect.collidepoint(pos):
+                    self.player.update(terminal.rect.centerx, terminal.rect.centery + 50)
+                    self.interact_target = terminal
+                    self.notice = f"{terminal.name}: press E to open."
+                    return
+            return
+        
+        # Check nav badge click (top right circle)
+        nav_center = (978, 38)
+        if math.hypot(pos[0] - nav_center[0], pos[1] - nav_center[1]) <= 32:
+            self.exit_menu_active = not self.exit_menu_active
+            return
+
+        # Check return to ship button in exit menu
+        if self.exit_menu_active:
+            panel = pygame.Rect(212, 116, 600, 360)
+            btn_rect = pygame.Rect(panel.centerx - 110, panel.bottom - 80, 220, 46)
+            if btn_rect.collidepoint(pos):
+                is_host = self.network.mode == "host" or self.network.mode == "solo"
+                if is_host and self.all_joined_ready():
+                    self.exit_menu_active = False
+                    self.screen_state = "ship"
+                    self.selected = None
+                    self.active_terminal = "Navigation Bay"
+                    self.transition_timer = 0.55
+                    self.transition_label = "Returning to the Navigation Bay."
+                    self.network.send({"type": "return_ship"})
+                    self.notice = "Interact with a door to find your fragment of the code."
+                elif is_host:
+                    self.notice = "Waiting for all crew to press E."
+                else:
+                    self.notice = "Only the host can initiate return to ship."
+            return
+
+        clicked = self.body_at(pos)
+        if self.mode != "measure":
+            if clicked:
+                self.notice = f"{clicked}: screen position {pos[0]}, {pos[1]}"
+            return
+
+        if clicked is None:
+            self.notice = "Click Red Dwarf, Perihelion, Aphelion, Exoplanet, or Focus."
+            return
+        if self.selected is None:
+            self.selected = clicked
+            self.notice = f"Selected {clicked}. Choose the second body."
+            return
+        if clicked == self.selected:
+            self.notice = "Choose a different second body."
+            return
+
+        measurement_t = self.t
+        distance = self.distance_between(self.selected, clicked, measurement_t)
+        start = self.selected
+        self.measurements.append(Measurement(self.selected, clicked, distance, measurement_t))
+        self.measure_flash = 1.2
+        self.notice = f"Recorded {self.selected} to {clicked}: {distance:.1f} units."
+        self.network.send({
+            "type": "measurement",
+            "start": start,
+            "end": clicked,
+            "distance": distance,
+            "t": measurement_t,
+        })
+        self.selected = None
+
+    def save_measurements(self) -> None:
+        out_dir = Path(__file__).resolve().parent / "logs"
+        out_dir.mkdir(exist_ok=True)
+        out_file = out_dir / f"measurements_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        with out_file.open("w", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["start", "end", "distance", "orbit_t"])
+            for m in self.measurements:
+                writer.writerow([m.start, m.end, f"{m.distance:.3f}", f"{m.t:.6f}"])
+        self.notice = f"Saved {len(self.measurements)} measurements to {out_file.name}."
+
+    def update(self, dt: float) -> None:
+        if self.menu_active:
+            return
+        self.apply_network_messages()
+        self.sync_local_player_position(dt)
+        self.update_multiplayer(dt)
+        if self.screen_state == "ship":
+            self.update_ship(dt)
+            self.transition_timer = max(0.0, self.transition_timer - dt)
+            return
+        if not self.paused:
+            self.t = (self.t + dt * 0.035) % 1.0
+        self.transition_timer = max(0.0, self.transition_timer - dt)
+        self.measure_flash = max(0.0, self.measure_flash - dt)
+
+    def sync_local_player_position(self, dt: float) -> None:
+        self.local_crew_member().pos = (round(self.player.x), round(self.player.y))
+        if self.network.mode == "solo":
+            return
+        self.position_sync_timer += dt
+        if self.position_sync_timer < 0.08:
+            return
+        self.position_sync_timer = 0.0
+        self.network.send({
+            "type": "player_pos",
+            "name": self.network.name,
+            "x": round(self.player.x),
+            "y": round(self.player.y),
+        })
+
+    def update_multiplayer(self, dt: float) -> None:
+        if self.screen_state != "orbit":
+            return
+        if self.network.mode != "solo":
+            return
+        self.multiplayer_timer += dt
+        join_times = [0.0, 0.35, 0.7, 1.05]
+        ready_times = [0.0, 0.75, 1.1, 1.45]
+        for i, member in enumerate(self.crew):
+            if self.multiplayer_timer >= join_times[i]:
+                member.joined = True
+            if self.multiplayer_timer >= ready_times[i]:
+                member.ready = True
+
+    def update_ship(self, dt: float) -> None:
+        keys = pygame.key.get_pressed()
+        direction = pygame.Vector2(0, 0)
+        if keys[pygame.K_a] or keys[pygame.K_LEFT]:
+            direction.x -= 1
+            self.player_facing = "left"
+        elif keys[pygame.K_d] or keys[pygame.K_RIGHT]:
+            direction.x += 1
+            self.player_facing = "right"
+
+        if keys[pygame.K_w] or keys[pygame.K_UP]:
+            direction.y -= 1
+        elif keys[pygame.K_s] or keys[pygame.K_DOWN]:
+            direction.y += 1
+
+        if direction.length_squared() > 0:
+            direction = direction.normalize()
+            self.player += direction * self.player_speed * dt
+            self.player.x = max(46, min(WIDTH - 46, self.player.x))
+            self.player.y = max(80, min(HEIGHT - 58, self.player.y))
+
+        self.interact_target = None
+        player_rect = pygame.Rect(round(self.player.x - 18), round(self.player.y - 24), 36, 48)
+        for terminal in self.terminals:
+            interact_area = terminal.rect.inflate(58, 70)
+            if interact_area.colliderect(player_rect):
+                self.interact_target = terminal
+                break
+
+    def draw_text(self, text: str, x: int, y: int, color: tuple[int, int, int] = TEXT) -> None:
+        self.screen.blit(self.font.render(text, True, color), (x, y))
+
+    def draw_scene(self) -> None:
+        if self.menu_active:
+            self.draw_start_menu()
+            return
+        if self.screen_state == "ship":
+            self.draw_ship()
+            return
+
+        if self.background:
+            self.screen.blit(self.background, (0, 0))
+            tint = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            tint.fill((0, 0, 0, 130))
+            self.screen.blit(tint, (0, 0))
+        else:
+            self.screen.fill(BACKGROUND)
+
+        pygame.draw.rect(self.screen, (5, 24, 35), (32, 84, 700, 408), border_radius=18)
+        pygame.draw.rect(self.screen, PANEL_LIGHT, (32, 84, 700, 408), 2, border_radius=18)
+        if self.frame_bg:
+            self.screen.blit(self.frame_bg, (18, 92))
+
+        points = [self.world_to_screen(p) for p in self.orbit.polyline()]
+        pygame.draw.lines(self.screen, ORBIT, False, points, 2)
+
+        for m in self.measurements:
+            start = self.world_to_screen(self.body_position_at_measurement(m.start, m.t))
+            end = self.world_to_screen(self.body_position_at_measurement(m.end, m.t))
+            width = 4 if self.measure_flash > 0 and m == self.measurements[-1] else 2
+            pygame.draw.line(self.screen, MEASURE, start, end, width)
+            mid = ((start[0] + end[0]) // 2, (start[1] + end[1]) // 2)
+            value = self.small.render(f"{m.distance:.1f} units", True, MEASURE)
+            bg_rect = value.get_rect(center=(mid[0], mid[1] - 14)).inflate(14, 8)
+            pygame.draw.rect(self.screen, PANEL, bg_rect, border_radius=6)
+            pygame.draw.rect(self.screen, MEASURE, bg_rect, 1, border_radius=6)
+            self.screen.blit(value, value.get_rect(center=bg_rect.center))
+            for name in (m.start, m.end):
+                if name == "Exoplanet":
+                    ghost = self.world_to_screen(self.orbit.point_at(m.t))
+                    pygame.draw.circle(self.screen, (130, 150, 170), ghost, 10, 1)
+
+        bodies = self.bodies()
+        label_offsets = {
+            "Red Dwarf": (-44, 34),
+            "Perihelion": (16, 36),
+            "Aphelion": (18, -8),
+            "Focus": (18, -8),
+            "Exoplanet": (20, -48),
+        }
+        for body in bodies.values():
+            pos = self.world_to_screen(body.pos)
+            if self.mode == "measure":
+                pulse = 2 + int((math.sin(pygame.time.get_ticks() / 180) + 1) * 2)
+                pygame.draw.circle(self.screen, MEASURE if body.name == self.selected else ACCENT, pos, body.radius + 11 + pulse, 1)
+            if body.name == "Exoplanet" and self.planet_texture:
+                rect = self.planet_texture.get_rect(center=pos)
+                self.screen.blit(self.planet_texture, rect)
+            else:
+                pygame.draw.circle(self.screen, body.color, pos, body.radius)
+                pygame.draw.circle(self.screen, (255, 255, 255), pos, body.radius, 1)
+            label = self.small.render(body.name, True, TEXT)
+            offset = label_offsets.get(body.name, (body.radius + 6, -8))
+            self.screen.blit(label, (pos[0] + offset[0], pos[1] + offset[1]))
+
+        if self.selected:
+            selected = bodies[self.selected]
+            pygame.draw.circle(self.screen, MEASURE, self.world_to_screen(selected.pos), selected.radius + 8, 2)
+
+    def draw_panel(self) -> None:
+        if self.menu_active:
+            return
+        if self.screen_state == "ship":
+            self.draw_objective("Interact with a door to find your fragment of the code.")
+            self.draw_nav_badge()
+            self.draw_crew_status(pygame.Rect(742, 82, 248, 138))
+            message = self.notice
+            if self.interact_target:
+                message = f"{self.interact_target.name}: press E to open this console."
+            self.draw_dialog("Nova", message)
+            self.draw_transition_modal()
+            return
+
+        objective = "Use the simulation console to compare orbital distances."
+        if self.interact_target:
+            objective = self.interact_target.description
+        self.draw_objective(objective)
+        self.draw_nav_badge()
+
+        status = pygame.Rect(752, 92, 238, 220)
+        self.draw_glow_rect(status, PANEL, PANEL_LIGHT, radius=12, alpha=240, width=1)
+        self.screen.blit(self.title.render(self.active_terminal, True, TEXT), (status.x + 20, status.y + 18))
+        self.draw_text(f"Mode: {self.mode.title()}", status.x + 20, status.y + 64, ACCENT)
+        self.draw_text(f"Orbit t: {self.t:.3f}", status.x + 20, status.y + 96, MUTED)
+        self.draw_text("Paused" if self.paused else "Running", status.x + 20, status.y + 126, MUTED)
+        ready = sum(member.ready for member in self.crew)
+        self.draw_text(f"Team ready: {ready}/{len(self.crew)}", status.x + 20, status.y + 152, ACCENT)
+        controls = "Tab return  Space pause\nM measure  O observe  +/- zoom"
+        self.draw_wrapped(controls, self.micro, MUTED, pygame.Rect(status.x + 20, status.y + 176, status.width - 40, 34), line_gap=0)
+
+        log = pygame.Rect(752, 330, 238, 142)
+        self.draw_glow_rect(log, PANEL, PANEL_LIGHT, radius=12, alpha=230, width=1)
+        self.screen.blit(self.font.render("Mission Log", True, TEXT), (log.x + 20, log.y + 16))
+        if not self.measurements:
+            self.draw_wrapped("No measurements yet.", self.small, MUTED, pygame.Rect(log.x + 20, log.y + 40, log.width - 40, 44))
+        else:
+            y = log.y + 48
+            for i, m in enumerate(self.measurements[-3:], start=max(1, len(self.measurements) - 2)):
+                text = f"{i}. {m.start} -> {m.end}"
+                self.screen.blit(self.small.render(text, True, TEXT), (log.x + 20, y))
+                self.screen.blit(self.micro.render(f"{m.distance:.1f} units @ {m.t:.2f}", True, MUTED), (log.x + 30, y + 20))
+                y += 42
+
+        if self.measure_flash > 0 and self.measurements:
+            latest = self.measurements[-1]
+            banner = pygame.Rect(212, 82, 330, 48)
+            self.draw_glow_rect(banner, PANEL, MEASURE, radius=10, alpha=246, width=2)
+            text = f"Distance captured: {latest.distance:.1f} units"
+            self.screen.blit(self.small.render(text, True, TEXT), (banner.x + 22, banner.y + 14))
+
+        if self.exit_menu_active:
+            self.draw_exit_status_panel()
+
+    def draw_exit_status_panel(self) -> None:
+        panel = pygame.Rect(212, 116, 600, 360)
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((4, 16, 22, 180))
+        self.screen.blit(overlay, (0, 0))
+
+        self.draw_glow_rect(panel, PANEL, PANEL_LIGHT, radius=20, alpha=252, width=2)
+        title = self.title.render("MISSION COMPLETION STATUS", True, TEXT)
+        self.screen.blit(title, title.get_rect(center=(panel.centerx, panel.y + 44)))
+
+        hint = self.micro.render("Press E to toggle your readiness. Click the Nav icon to return to task.", True, MUTED)
+        self.screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.y + 82)))
+
+        joined = self.joined_crew()
+        if joined:
+            spacing = panel.width // (len(joined) + 1)
+            for i, member in enumerate(joined):
+                cx = panel.x + spacing * (i + 1)
+                cy = panel.y + 180
+
+                # Ready square (Decently sized)
+                if member.ready:
+                    pygame.draw.rect(self.screen, member.color, (cx - 40, cy - 60, 80, 80), border_radius=12)
+                    pygame.draw.rect(self.screen, TEXT, (cx - 40, cy - 60, 80, 80), 2, border_radius=12)
+                else:
+                    # Slot placeholder
+                    pygame.draw.rect(self.screen, (20, 40, 50), (cx - 40, cy - 60, 80, 80), border_radius=12)
+                    pygame.draw.rect(self.screen, MUTED, (cx - 40, cy - 60, 80, 80), 1, border_radius=12)
+
+                # Name label at bottom
+                name_label = self.small.render(member.name.upper(), True, TEXT)
+                self.screen.blit(name_label, name_label.get_rect(center=(cx, cy + 50)))
+                role_label = self.micro.render(member.role, True, member.color)
+                self.screen.blit(role_label, role_label.get_rect(center=(cx, cy + 72)))
+
+        # Return button (Host Only)
+        btn_rect = pygame.Rect(panel.centerx - 110, panel.bottom - 80, 220, 46)
+        all_ready = self.all_joined_ready()
+        is_host = self.network.mode == "host" or self.network.mode == "solo"
+
+        btn_color = ACCENT if (all_ready and is_host) else MUTED
+        self.draw_glow_rect(btn_rect, (20, 45, 55), btn_color, radius=10, alpha=255, width=2)
+
+        btn_label = "RETURN TO SHIP" if is_host else "WAITING FOR HOST"
+        label = self.small.render(btn_label, True, btn_color)
+        self.screen.blit(label, label.get_rect(center=btn_rect.center))
+
+    def draw_ship(self) -> None:
+        self.screen.fill((194, 199, 204))
+        if self.ship_map:
+            self.screen.blit(self.ship_map, (0, 0))
+            tint = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            tint.fill((244, 247, 249, 16))
+            self.screen.blit(tint, (0, 0))
+        else:
+            pygame.draw.rect(self.screen, (244, 246, 248), (84, 24, 856, 510), border_radius=8)
+            pygame.draw.rect(self.screen, SHIP_WALL, (84, 24, 856, 510), 4, border_radius=8)
+
+        for terminal in self.terminals:
+            label = self.micro.render(terminal.name.upper(), True, TEXT)
+            label_rect = label.get_rect(center=(terminal.rect.centerx, terminal.rect.y - 12))
+            pygame.draw.rect(self.screen, PANEL, label_rect.inflate(18, 10), border_radius=6)
+            pygame.draw.rect(self.screen, terminal.color, label_rect.inflate(18, 10), 2, border_radius=6)
+            self.screen.blit(label, label_rect)
+            if self.interact_target == terminal and terminal.name != "Navigation Bay":
+                pygame.draw.rect(self.screen, terminal.color, terminal.rect.inflate(8, 8), 3, border_radius=8)
+                if self.prompt_icon:
+                    prompt_rect = self.prompt_icon.get_rect(center=(terminal.rect.centerx, terminal.rect.y - 56))
+                    self.screen.blit(self.prompt_icon, prompt_rect)
+                else:
+                    prompt = self.font.render("E", True, BACKGROUND)
+                    pygame.draw.circle(self.screen, TEXT, (terminal.rect.centerx, terminal.rect.y - 56), 17)
+                    self.screen.blit(prompt, prompt.get_rect(center=(terminal.rect.centerx, terminal.rect.y - 56)))
+
+        self.draw_remote_crew()
+
+        px = round(self.player.x)
+        py = round(self.player.y)
+        pygame.draw.ellipse(self.screen, (0, 0, 0, 90), (px - 18, py + 12, 36, 10))
+        sprite = self.player_idle
+        keys = pygame.key.get_pressed()
+        moving = keys[pygame.K_a] or keys[pygame.K_d] or keys[pygame.K_w] or keys[pygame.K_s]
+        if moving and self.player_walk:
+            sprite = self.player_walk[(pygame.time.get_ticks() // 70) % len(self.player_walk)]
+        if sprite:
+            if self.player_facing == "right":
+                sprite = pygame.transform.flip(sprite, True, False)
+            self.screen.blit(sprite, sprite.get_rect(center=(px, py - 18)))
+
+            member = self.local_crew_member()
+            self.draw_nameplate(member.name, member.color, px, py)
+        else:
+            pygame.draw.rect(self.screen, (82, 190, 255), (px - 13, py - 22, 26, 36), border_radius=5)
+            pygame.draw.circle(self.screen, (228, 236, 246), (px, py - 31), 12)
+
+        if self.interact_target and self.interact_target.name != "Navigation Bay":
+            self.notice = f"{self.interact_target.name}: press E to open."
+
+    async def run(self) -> None:
+        while self.running:
+            dt = self.clock.tick(FPS) / 1000.0
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+                elif event.type == pygame.KEYDOWN:
+                    self.handle_key(event)
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    self.handle_click(event.pos)
+
+            self.update(dt)
+            self.draw_scene()
+            self.draw_panel()
+            pygame.display.flip()
+            await asyncio.sleep(0)
+        self.network.close()
+        pygame.quit()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Kepler Path Pygame prototype")
+    parser.add_argument("--host-session", action="store_true", help="Host an optional LAN session")
+    parser.add_argument("--join", metavar="HOST", help="Join an optional LAN session")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--name", default="Player")
+    args = parser.parse_args()
+
+    mode = "menu"
+    host = "127.0.0.1"
+    if args.host_session:
+        mode = "host"
+    elif args.join:
+        mode = "join"
+        host = args.join
+    asyncio.run(KeplerGame(mode, host, args.port, args.name).run())
+
+
+def demo_check() -> str:
+    game = KeplerGame()
+    game.update(1 / 60)
+    if game.screen_state != "ship":
+        raise RuntimeError("demo must start in the spaceship navigation bay")
+    game.draw_scene()
+    game.draw_panel()
+    pygame.display.flip()
+
+    game.screen_state = "orbit"
+    game.mode = "measure"
+    game.handle_click(game.world_to_screen(game.bodies()["Red Dwarf"].pos))
+    game.handle_click(game.world_to_screen(game.bodies()["Perihelion"].pos))
+    if len(game.measurements) != 1:
+        raise RuntimeError("measurement smoke test failed")
+    distance = game.measurements[0].distance
+    pygame.quit()
+    return f"demo check ok: recorded distance {distance:.1f} units"
+
+
+if __name__ == "__main__":
+    main()

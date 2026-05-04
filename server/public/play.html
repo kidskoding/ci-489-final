@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Kepler Path - Simulation</title>
+    <style>
+        body { margin: 0; background: #061822; overflow: hidden; font-family: sans-serif; }
+        #header {
+            height: 50px;
+            background: #082b38;
+            display: flex;
+            align-items: center;
+            padding: 0 20px;
+            border-bottom: 2px solid #1cebf4;
+            color: #1cebf4;
+            justify-content: space-between;
+        }
+        iframe {
+            width: 100vw;
+            height: calc(100vh - 52px);
+            border: none;
+        }
+        .user-info { color: #f4fbfd; font-size: 0.9rem; }
+        .logout { color: #84aaa2; cursor: pointer; margin-left: 15px; text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div id="header">
+        <div>KEPLER PATH :: MISSION CONTROL</div>
+        <div class="user-info">
+            User: <span id="username-display"></span>
+            <span class="logout" onclick="logout()">Logout</span>
+        </div>
+    </div>
+    <!-- The iframe will load the pygbag-built index.html -->
+    <iframe id="game-frame" src="/game/index.html"></iframe>
+
+    <script>
+        if (!localStorage.getItem('token')) {
+            window.location.href = '/index.html';
+        }
+        document.getElementById('username-display').innerText = localStorage.getItem('username');
+
+        function logout() {
+            localStorage.clear();
+            window.location.href = '/index.html';
+        }
+    </script>
+</body>
+</html>
