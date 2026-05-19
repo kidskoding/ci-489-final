@@ -35,7 +35,6 @@
     <!-- The iframe loads the pygbag build and passes this backend as the WebSocket relay. -->
     <iframe id="game-frame" title="Kepler Path Simulation"></iframe>
 
-    <script src="/config.js"></script>
     <script>
         if (!localStorage.getItem('token')) {
             window.location.href = '/index.html';
@@ -43,7 +42,7 @@
         document.getElementById('username-display').innerText = localStorage.getItem('username');
 
         const gameFrame = document.getElementById('game-frame');
-        const gameUrl = new URL(window.KEPLER_CONFIG.gameUrl);
+        const gameUrl = new URL('/game/', window.location.origin);
         gameUrl.searchParams.set('relay', window.location.host);
         gameFrame.src = gameUrl.toString();
 
