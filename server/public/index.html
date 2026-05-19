@@ -4,30 +4,11 @@
     <meta charset="UTF-8">
     <title>Kepler Path - Simulation</title>
     <style>
-        body { margin: 0; background: #061822; overflow: hidden; font-family: sans-serif; }
-        #header {
-            height: 50px;
-            background: #082b38;
-            display: flex;
-            align-items: center;
-            padding: 0 20px;
-            border-bottom: 2px solid #1cebf4;
-            color: #1cebf4;
-            justify-content: space-between;
-        }
-        iframe {
-            width: 100vw;
-            height: calc(100vh - 52px);
-            border: none;
-        }
-        .user-info { color: #f4fbfd; font-size: 0.9rem; }
-        .logout { color: #84aaa2; cursor: pointer; margin-left: 15px; text-decoration: underline; }
+        body { margin: 0; background: #061822; overflow: hidden; }
+        iframe { width: 100vw; height: 100vh; border: none; }
     </style>
 </head>
 <body>
-    <div id="header">
-        <div>KEPLER PATH :: MISSION CONTROL</div>
-    </div>
     <!-- The iframe loads the pygbag build and passes this backend as the WebSocket relay. -->
     <iframe id="game-frame" title="Kepler Path Simulation"></iframe>
 
