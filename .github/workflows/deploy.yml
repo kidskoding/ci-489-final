@@ -49,6 +49,8 @@ jobs:
         run: |
           rm -rf server/public/game
           cp -R /tmp/kepler-path-web/build/web server/public/game
+          sed -i 's/ume_block : 1/ume_block : 0/' server/public/game/index.html
+          sed -i 's/autorun : 0/autorun : 1/' server/public/game/index.html
 
       - name: Commit and push game files
         run: |
