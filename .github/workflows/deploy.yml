@@ -57,3 +57,6 @@ jobs:
           git add server/public/game
           git diff --staged --quiet || git commit -m "build: update pygbag game files [skip ci]"
           git push
+
+      - name: Trigger Render deploy
+        run: curl -s -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
