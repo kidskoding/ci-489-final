@@ -27,29 +27,15 @@
 <body>
     <div id="header">
         <div>KEPLER PATH :: MISSION CONTROL</div>
-        <div class="user-info">
-            User: <span id="username-display"></span>
-            <span class="logout" onclick="logout()">Logout</span>
-        </div>
     </div>
     <!-- The iframe loads the pygbag build and passes this backend as the WebSocket relay. -->
     <iframe id="game-frame" title="Kepler Path Simulation"></iframe>
 
     <script>
-        if (!localStorage.getItem('token')) {
-            window.location.href = '/index.html';
-        }
-        document.getElementById('username-display').innerText = localStorage.getItem('username');
-
         const gameFrame = document.getElementById('game-frame');
         const gameUrl = new URL('/game/', window.location.origin);
         gameUrl.searchParams.set('relay', window.location.host);
         gameFrame.src = gameUrl.toString();
-
-        function logout() {
-            localStorage.clear();
-            window.location.href = '/index.html';
-        }
     </script>
 </body>
 </html>

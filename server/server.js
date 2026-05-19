@@ -21,6 +21,10 @@ const ENABLE_DISCOVERY = process.env.ENABLE_DISCOVERY === 'true';
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+app.get('/', (req, res) => {
+  res.redirect('/play.html');
+});
+
 app.get('/healthz', (req, res) => {
   res.json({ ok: true });
 });
