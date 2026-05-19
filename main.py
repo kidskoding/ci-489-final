@@ -1,6 +1,11 @@
-from game import main
+import asyncio
+
+from game import KeplerGame
 
 
-if __name__ == "__main__":
-    main()
+async def main():
+    game = KeplerGame("menu", "127.0.0.1:3000", 3000, "Player")
+    await game.run()
 
+
+asyncio.run(main())
