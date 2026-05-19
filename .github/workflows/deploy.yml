@@ -17,6 +17,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    environment:
+      name: prod
+      url: https://ci-489-final.onrender.com
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
