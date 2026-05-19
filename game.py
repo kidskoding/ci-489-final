@@ -122,6 +122,24 @@ class OrbitPreset:
     period: float
 
 
+@dataclass(frozen=True)
+class TutorialStep:
+    message: str
+    event: str
+    target: str | None
+
+
+TUTORIAL_STEPS: list[TutorialStep] = [
+    TutorialStep("Click the Red Dwarf star to select it.", "star", "Red Dwarf"),
+    TutorialStep("Now click Aphelion — the farthest orbit point — to measure the star's distance.", "aphelion_measure", "Aphelion"),
+    TutorialStep("Red Dwarf is pre-selected. Now click Perihelion — the nearest point.", "perihelion_measure", "Perihelion"),
+    TutorialStep("Perihelion is much closer. The star sits at a focus, not the center — Kepler's First Law! Click anywhere to continue.", "continue", None),
+    TutorialStep("Press Space to pause and resume the orbit.", "pause", None),
+    TutorialStep("Press + or − to zoom in and out.", "zoom", None),
+    TutorialStep("All done! Click the nav icon to return to the ship.", "nav", "nav"),
+]
+
+
 LESSON_MODES = {
     "law1": LessonMode(
         "law1",
@@ -348,7 +366,7 @@ class KeplerGame:
         self.background = self.load_background()
         self.planet_texture = self.load_planet_texture()
         self.ship_map = self.load_scaled(SHIP_MAP_PATH, (WIDTH, HEIGHT))
-        self.prompt_icon = self.load_scaled(PROMPT_PATH, (66, 66))
+        self.prompt_icon = self.load_scaled(PROMPT_PATH, (44, 44))
         self.player_idle = self.load_scaled(PLAYER_IDLE_PATH, (52, 44))
         self.player_walk = self.load_player_walk()
 
@@ -407,7 +425,7 @@ class KeplerGame:
             ),
             Terminal(
                 "Law 2 Lab",
-                pygame.Rect(678, 150, 130, 78),
+                pygame.Rect(462, 328, 132, 102),
                 "law2",
                 "Capture equal-time orbital sweeps and compare areas.",
                 (244, 114, 182),
@@ -428,7 +446,7 @@ class KeplerGame:
             ),
             Terminal(
                 "Navigation Bay",
-                pygame.Rect(462, 328, 132, 102),
+                pygame.Rect(678, 150, 130, 78),
                 "ship",
                 "Return to the crew navigation map.",
                 (76, 217, 100),
@@ -865,7 +883,7 @@ class KeplerGame:
             self.law3_index = 1
         elif mode == "tutorial":
             self.paused = False
-            self.t = 0.0
+            self.t = 0.25
 
     def current_lesson(self) -> LessonMode | None:
         return LESSON_MODES.get(self.mode)
@@ -907,25 +925,44 @@ class KeplerGame:
         else:
             self.notice = f"Selected {preset.name}. Compare the ratio and find another world with the same constant."
 
+    def _handle_tutorial_click(self, clicked: str) -> None:
+        if not self.tutorial_active or self.tutorial_step >= len(TUTORIAL_STEPS):
+            return
+        step = TUTORIAL_STEPS[self.tutorial_step]
+        if step.event == "star" and clicked == "Red Dwarf":
+            self.selected = clicked
+            self.advance_tutorial("star")
+        elif step.event == "aphelion_measure" and self.selected == "Red Dwarf" and clicked == "Aphelion":
+            measurement_t = self.t
+            distance = self.distance_between("Red Dwarf", "Aphelion", measurement_t)
+            self.measurements.append(Measurement("Red Dwarf", "Aphelion", distance, measurement_t))
+            self.measure_flash = 1.2
+            self.advance_tutorial("aphelion_measure")
+        elif step.event == "perihelion_measure" and self.selected == "Red Dwarf" and clicked == "Perihelion":
+            measurement_t = self.t
+            distance = self.distance_between("Red Dwarf", "Perihelion", measurement_t)
+            self.measurements.append(Measurement("Red Dwarf", "Perihelion", distance, measurement_t))
+            self.measure_flash = 1.2
+            self.advance_tutorial("perihelion_measure")
+        elif step.event == "continue":
+            self.advance_tutorial("continue")
+        elif step.target is not None and clicked != step.target:
+            self.notice = f"Try clicking {step.target} instead."
+
     def tutorial_message(self) -> str:
-        steps = [
-            "Step 1: click Red Dwarf to select the star.",
-            "Step 2: click Perihelion to record a star-to-perihelion distance.",
-            "Step 3: press Space to pause and resume the orbit.",
-            "Step 4: click the nav icon in the top-right when your team is ready to return.",
-        ]
-        if self.tutorial_step >= len(steps):
+        if self.tutorial_step >= len(TUTORIAL_STEPS):
             return "Tutorial complete. Try the three law labs from the ship."
-        return steps[self.tutorial_step]
+        return TUTORIAL_STEPS[self.tutorial_step].message
 
     def advance_tutorial(self, event_name: str) -> None:
-        expected = ["star", "measurement", "pause", "nav"]
-        if not self.tutorial_active or self.tutorial_step >= len(expected):
+        if not self.tutorial_active or self.tutorial_step >= len(TUTORIAL_STEPS):
             return
-        if expected[self.tutorial_step] != event_name:
+        if TUTORIAL_STEPS[self.tutorial_step].event != event_name:
             return
         self.tutorial_step += 1
-        self.lesson_success = self.tutorial_step >= len(expected)
+        if self.tutorial_step == 2:
+            self.selected = "Red Dwarf"
+        self.lesson_success = self.tutorial_step >= len(TUTORIAL_STEPS)
         self.notice = self.tutorial_message()
 
     def open_terminal(self, terminal: Terminal, broadcast: bool = True) -> None:
@@ -1102,8 +1139,10 @@ class KeplerGame:
             self.save_measurements()
         elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
             self.zoom = min(1.7, self.zoom + 0.08)
+            self.advance_tutorial("zoom")
         elif event.key == pygame.K_MINUS:
             self.zoom = max(0.55, self.zoom - 0.08)
+            self.advance_tutorial("zoom")
         elif event.key == pygame.K_LEFT:
             self.rotation -= 0.08
         elif event.key == pygame.K_RIGHT:
@@ -1255,18 +1294,10 @@ class KeplerGame:
         clicked = self.body_at(pos)
         if self.mode != "measure":
             if clicked:
-                if self.mode == "tutorial" and self.selected == "Red Dwarf" and clicked in ("Perihelion", "Exoplanet"):
-                    measurement_t = self.t
-                    distance = self.distance_between("Red Dwarf", "Perihelion", measurement_t)
-                    self.measurements.append(Measurement("Red Dwarf", "Perihelion", distance, measurement_t))
-                    self.measure_flash = 1.2
-                    self.selected = None
-                    self.advance_tutorial("measurement")
-                    return
-                self.notice = f"{clicked}: screen position {pos[0]}, {pos[1]}"
-                if self.mode == "tutorial" and clicked == "Red Dwarf":
-                    self.selected = clicked
-                    self.advance_tutorial("star")
+                if self.mode == "tutorial":
+                    self._handle_tutorial_click(clicked)
+                else:
+                    self.notice = f"{clicked}: screen position {pos[0]}, {pos[1]}"
             return
 
         if clicked is None:
@@ -1286,8 +1317,6 @@ class KeplerGame:
         self.measurements.append(Measurement(self.selected, clicked, distance, measurement_t))
         self.measure_flash = 1.2
         self.notice = f"Recorded {self.selected} to {clicked}: {distance:.1f} units."
-        if self.tutorial_active and {self.selected, clicked} == {"Red Dwarf", "Perihelion"}:
-            self.advance_tutorial("measurement")
         self.network.send({
             "type": "measurement",
             "start": start,
@@ -1388,8 +1417,30 @@ class KeplerGame:
         color = ACCENT if active else MUTED
         self.lesson_buttons[key] = rect
         self.draw_glow_rect(rect, (16, 55, 68), color, radius=8, alpha=245, width=1)
-        text = self.small.render(label, True, TEXT if active else MUTED)
+        font = self.small
+        while font.size(label)[0] > rect.width - 14 and font.get_height() > 12:
+            font = pygame.font.SysFont("arial", max(12, font.get_height() - 1))
+        text = font.render(label, True, TEXT if active else MUTED)
         self.screen.blit(text, text.get_rect(center=rect.center))
+
+    def draw_tutorial_highlight(self) -> None:
+        if not self.tutorial_active or self.tutorial_step >= len(TUTORIAL_STEPS):
+            return
+        target = TUTORIAL_STEPS[self.tutorial_step].target
+        if target is None:
+            return
+        if target == "nav":
+            pos: tuple[int, int] = (978, 38)
+            base_radius = 28
+        else:
+            bodies = self.bodies()
+            if target not in bodies:
+                return
+            pos = self.world_to_screen(bodies[target].pos)
+            base_radius = bodies[target].radius
+        pulse = int(math.sin(pygame.time.get_ticks() / 300) * 4)
+        pygame.draw.circle(self.screen, ACCENT, pos, base_radius + 18 + pulse, 2)
+        pygame.draw.circle(self.screen, ACCENT, pos, base_radius + 10, 1)
 
     def draw_law2_captures(self) -> None:
         for capture in self.area_captures:
@@ -1410,36 +1461,39 @@ class KeplerGame:
         self.draw_glow_rect(rect, PANEL, PANEL_LIGHT, radius=12, alpha=240, width=1)
         self.screen.blit(self.micro.render(lesson.law.upper(), True, ACCENT), (rect.x + 18, rect.y + 14))
         self.screen.blit(self.title.render(lesson.title, True, TEXT), (rect.x + 18, rect.y + 34))
-        self.draw_wrapped(lesson.objective, self.small, TEXT, pygame.Rect(rect.x + 18, rect.y + 72, rect.width - 36, 58), line_gap=1)
-        y = rect.y + 136
+        self.draw_wrapped(lesson.objective, self.small, TEXT, pygame.Rect(rect.x + 18, rect.y + 72, rect.width - 36, 80), line_gap=1)
+        y = rect.y + 158
 
         if self.mode == "law1":
             e = self.orbit.eccentricity
-            self.draw_wrapped(lesson.description, self.micro, MUTED, pygame.Rect(rect.x + 18, y, rect.width - 36, 44), line_gap=0)
-            self.screen.blit(self.small.render(f"Eccentricity: {e:.2f}", True, ACCENT), (rect.x + 18, y + 54))
-            self.draw_action_button("law1_less", pygame.Rect(rect.x + 18, y + 84, 92, 34), "Less")
-            self.draw_action_button("law1_more", pygame.Rect(rect.x + 126, y + 84, 92, 34), "More")
+            self.draw_wrapped(lesson.description, self.micro, MUTED, pygame.Rect(rect.x + 18, y, rect.width - 36, 64), line_gap=0)
+            self.screen.blit(self.small.render(f"Eccentricity: {e:.2f}", True, ACCENT), (rect.x + 18, y + 70))
+            self.draw_action_button("law1_less", pygame.Rect(rect.x + 18, y + 100, 92, 34), "Less")
+            self.draw_action_button("law1_more", pygame.Rect(rect.x + 126, y + 100, 92, 34), "More")
         elif self.mode == "law2":
-            self.draw_wrapped(lesson.description, self.micro, MUTED, pygame.Rect(rect.x + 18, y, rect.width - 36, 44), line_gap=0)
-            self.draw_action_button("law2_capture", pygame.Rect(rect.x + 18, y + 54, rect.width - 36, 38), "Capture sweep")
-            cy = y + 104
+            self.draw_wrapped(lesson.description, self.micro, MUTED, pygame.Rect(rect.x + 18, y, rect.width - 36, 84), line_gap=0)
+            self.draw_action_button("law2_capture", pygame.Rect(rect.x + 18, y + 94, rect.width - 36, 38), "Capture sweep")
+            cy = y + 144
             for capture in self.area_captures:
-                self.screen.blit(self.micro.render(f"{capture.label}: {capture.area:.0f}", True, TEXT), (rect.x + 18, cy))
+                label_text = self.micro.render(f"{capture.label}:", True, TEXT)
+                area_text = self.micro.render(f"{capture.area:.0f}", True, TEXT)
+                self.screen.blit(label_text, (rect.x + 18, cy))
+                self.screen.blit(area_text, (rect.right - 18 - area_text.get_width(), cy))
                 cy += 18
         elif self.mode == "law3":
             preset = ORBIT_PRESETS[self.law3_index]
             ratio = preset.period ** 2 / preset.semi_major_axis ** 3
-            self.draw_wrapped(lesson.description, self.micro, MUTED, pygame.Rect(rect.x + 18, y, rect.width - 36, 38), line_gap=0)
-            self.screen.blit(self.font.render(preset.name, True, TEXT), (rect.x + 18, y + 46))
-            self.screen.blit(self.small.render(f"a = {preset.semi_major_axis:.2f} AU", True, MUTED), (rect.x + 18, y + 78))
-            self.screen.blit(self.small.render(f"T = {preset.period:.2f} years", True, MUTED), (rect.x + 18, y + 104))
-            self.screen.blit(self.small.render(f"T^2 / a^3 = {ratio:.2f}", True, ACCENT), (rect.x + 18, y + 130))
-            self.draw_action_button("law3_prev", pygame.Rect(rect.x + 18, y + 162, 92, 32), "Prev")
-            self.draw_action_button("law3_next", pygame.Rect(rect.x + 126, y + 162, 92, 32), "Next")
+            self.draw_wrapped(lesson.description, self.micro, MUTED, pygame.Rect(rect.x + 18, y, rect.width - 36, 56), line_gap=0)
+            self.screen.blit(self.font.render(preset.name, True, TEXT), (rect.x + 18, y + 64))
+            self.screen.blit(self.small.render(f"a = {preset.semi_major_axis:.2f} AU", True, MUTED), (rect.x + 18, y + 96))
+            self.screen.blit(self.small.render(f"T = {preset.period:.2f} years", True, MUTED), (rect.x + 18, y + 122))
+            self.screen.blit(self.small.render(f"T^2 / a^3 = {ratio:.2f}", True, ACCENT), (rect.x + 18, y + 148))
+            self.draw_action_button("law3_prev", pygame.Rect(rect.x + 18, y + 180, 92, 32), "Prev")
+            self.draw_action_button("law3_next", pygame.Rect(rect.x + 126, y + 180, 92, 32), "Next")
         elif self.mode == "tutorial":
             self.draw_wrapped(self.tutorial_message(), self.font, TEXT, pygame.Rect(rect.x + 18, y, rect.width - 36, 82), line_gap=2)
-            progress = min(self.tutorial_step, 4)
-            self.screen.blit(self.small.render(f"Progress: {progress}/4", True, ACCENT), (rect.x + 18, y + 104))
+            progress = min(self.tutorial_step, len(TUTORIAL_STEPS))
+            self.screen.blit(self.small.render(f"Progress: {progress}/{len(TUTORIAL_STEPS)}", True, ACCENT), (rect.x + 18, y + 104))
 
         if self.lesson_success:
             complete = pygame.Rect(rect.x + 18, rect.bottom - 44, rect.width - 36, 30)
@@ -1531,6 +1585,8 @@ class KeplerGame:
             selected = bodies[self.selected]
             pygame.draw.circle(self.screen, MEASURE, self.world_to_screen(selected.pos), selected.radius + 8, 2)
 
+        self.draw_tutorial_highlight()
+
     def draw_panel(self) -> None:
         if self.menu_active:
             return
@@ -1582,11 +1638,15 @@ class KeplerGame:
             self.draw_wrapped("No measurements yet.", self.small, MUTED, pygame.Rect(log.x + 20, log.y + 40, log.width - 40, 44))
         else:
             y = log.y + 48
-            for i, m in enumerate(self.measurements[-3:], start=max(1, len(self.measurements) - 2)):
+            row_height = 40
+            visible_count = max(1, (log.bottom - y - 12) // row_height)
+            visible_measurements = self.measurements[-visible_count:]
+            start_index = len(self.measurements) - len(visible_measurements) + 1
+            for i, m in enumerate(visible_measurements, start=start_index):
                 text = f"{i}. {m.start} -> {m.end}"
                 self.screen.blit(self.small.render(text, True, TEXT), (log.x + 20, y))
                 self.screen.blit(self.micro.render(f"{m.distance:.1f} units @ {m.t:.2f}", True, MUTED), (log.x + 30, y + 20))
-                y += 42
+                y += row_height
 
         if self.measure_flash > 0 and self.measurements:
             latest = self.measurements[-1]
@@ -1645,6 +1705,35 @@ class KeplerGame:
         label = self.small.render(btn_label, True, btn_color)
         self.screen.blit(label, label.get_rect(center=btn_rect.center))
 
+    def terminal_visual_rect(self, terminal: Terminal) -> pygame.Rect:
+        visual_bounds = {
+            "Crew Lounge": pygame.Rect(164, 250, 92, 106),
+            "Training Sim": pygame.Rect(302, 84, 190, 156),
+            "Law 1 Lab": pygame.Rect(508, 176, 168, 108),
+            "Law 2 Lab": pygame.Rect(540, 350, 174, 100),
+            "Law 3 Lab": pygame.Rect(750, 250, 110, 108),
+            "Measure Bay": pygame.Rect(302, 252, 164, 128),
+            "Navigation Bay": pygame.Rect(476, 286, 178, 46),
+        }
+        return visual_bounds.get(terminal.name, terminal.rect)
+
+    def terminal_label_center(self, terminal: Terminal, visual_rect: pygame.Rect) -> tuple[int, int]:
+        if terminal.name == "Navigation Bay":
+            return visual_rect.center
+        if terminal.name == "Law 2 Lab":
+            return visual_rect.center
+        upper_labels = {"Training Sim", "Law 1 Lab"}
+        if terminal.name in upper_labels:
+            if self.interact_target == terminal:
+                return visual_rect.centerx, visual_rect.y + 62
+            return visual_rect.centerx, visual_rect.y + 18
+        return visual_rect.centerx, visual_rect.bottom - 18
+
+    def terminal_label_bounds(self, terminal: Terminal, visual_rect: pygame.Rect) -> pygame.Rect:
+        if terminal.name == "Law 2 Lab":
+            return visual_rect.inflate(-12, -12)
+        return visual_rect.inflate(-10, -10)
+
     def draw_ship(self) -> None:
         self.screen.fill((194, 199, 204))
         if self.ship_map:
@@ -1657,16 +1746,18 @@ class KeplerGame:
             pygame.draw.rect(self.screen, SHIP_WALL, (84, 24, 856, 510), 4, border_radius=8)
 
         for terminal in self.terminals:
+            visual_rect = self.terminal_visual_rect(terminal)
             label = self.micro.render(terminal.name.upper(), True, TEXT)
-            label_rect = label.get_rect(center=(terminal.rect.centerx, terminal.rect.y - 12))
-            pygame.draw.rect(self.screen, PANEL, label_rect.inflate(18, 10), border_radius=6)
-            pygame.draw.rect(self.screen, terminal.color, label_rect.inflate(18, 10), 2, border_radius=6)
+            label_rect = label.get_rect(center=self.terminal_label_center(terminal, visual_rect))
+            badge_rect = label_rect.inflate(14, 8)
+            badge_rect.clamp_ip(self.terminal_label_bounds(terminal, visual_rect))
+            label_rect.center = badge_rect.center
+            pygame.draw.rect(self.screen, PANEL, badge_rect, border_radius=6)
+            pygame.draw.rect(self.screen, terminal.color, badge_rect, 2, border_radius=6)
             self.screen.blit(label, label_rect)
             if self.interact_target == terminal and terminal.name != "Navigation Bay":
-                pygame.draw.rect(self.screen, terminal.color, terminal.rect.inflate(8, 8), 3, border_radius=8)
-                prompt_center = (terminal.rect.centerx, terminal.rect.y - 56)
-                if terminal.rect.y < 150:
-                    prompt_center = (terminal.rect.right + 34, terminal.rect.y + 20)
+                pygame.draw.rect(self.screen, terminal.color, visual_rect.inflate(8, 8), 3, border_radius=8)
+                prompt_center = (visual_rect.centerx, visual_rect.y + 24)
                 if self.prompt_icon:
                     prompt_rect = self.prompt_icon.get_rect(center=prompt_center)
                     self.screen.blit(self.prompt_icon, prompt_rect)
