@@ -1,3 +1,4 @@
 pygame>=2.5
 pytest>=7.0
 pytest
+websockets>=12.0

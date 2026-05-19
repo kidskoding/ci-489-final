@@ -24,21 +24,57 @@ pip install -r requirements.txt
 python3 main.py
 ```
 
-### 2. Multi-player Relay (Optional)
+Or, after the virtualenv is active:
+
+```bash
+make install
+make run
+```
+
+### 2. Multiplayer Relay (Optional)
 
 If you want to host a collaborative session, start the relay server:
 
 ```bash
 cd server
 npm install
-node server.js
+npm start
 ```
+
+## Export Builds
+
+Install the build tools once:
+
+```bash
+source .venv/bin/activate
+make install-build
+```
+
+### Web Build
+
+```bash
+make web
+```
+
+This creates the browser build at `build/web/`. You can upload that folder to GitHub Pages, Netlify, itch.io, or any static web host. The included GitHub Actions workflow also builds and deploys this automatically when pushed to `main`.
+
+For free multiplayer hosting, deploy the static game to GitHub Pages and deploy the `server/` app to Render Free using `render.yaml`. See `WEB_DEPLOYMENT.md` for the exact steps.
+
+### Mac App Build
+
+```bash
+make mac-app
+```
+
+This creates `dist/Kepler Path.app`, which can be opened on macOS. If Gatekeeper blocks it on another Mac, right-click the app and choose Open, or codesign/notarize it for public distribution.
 
 ## Controls
 
 ### Navigation Bay (Ship)
 - **WASD**: Move your crew member
 - **E**: Interact with a console/terminal
+- **T**: Start the interactive tutorial
+- **1 / 2 / 3**: Jump to the Kepler Law 1, 2, or 3 labs
 
 ### Orbital Simulation
 - **M**: Measure mode (Click two bodies to record distance)
@@ -52,6 +88,12 @@ node server.js
 - **Tab / Q**: Return to Ship
 - **R**: Reset simulation
 - **Esc**: Quit
+
+### Learning Modes
+- **Training Sim**: Guided tutorial that walks students through selecting the star, measuring perihelion distance, pausing the orbit, and returning to ship.
+- **Law 1 Lab**: Interactive orbit-shape challenge for eccentricity and ellipse foci.
+- **Law 2 Lab**: Equal-time area capture challenge for sweep comparisons.
+- **Law 3 Lab**: Planet preset comparison for the `T^2 / a^3` period relationship.
 
 ## Assets & Clean Migration
 

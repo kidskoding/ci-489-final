@@ -32,14 +32,20 @@
             <span class="logout" onclick="logout()">Logout</span>
         </div>
     </div>
-    <!-- The iframe will load the pygbag-built index.html from GitHub Pages -->
-    <iframe id="game-frame" src="https://kidskoding.github.io/ci-489-final/"></iframe>
+    <!-- The iframe loads the pygbag build and passes this backend as the WebSocket relay. -->
+    <iframe id="game-frame" title="Kepler Path Simulation"></iframe>
 
+    <script src="/config.js"></script>
     <script>
         if (!localStorage.getItem('token')) {
             window.location.href = '/index.html';
         }
         document.getElementById('username-display').innerText = localStorage.getItem('username');
+
+        const gameFrame = document.getElementById('game-frame');
+        const gameUrl = new URL(window.KEPLER_CONFIG.gameUrl);
+        gameUrl.searchParams.set('relay', window.location.host);
+        gameFrame.src = gameUrl.toString();
 
         function logout() {
             localStorage.clear();

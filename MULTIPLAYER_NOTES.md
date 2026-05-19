@@ -4,7 +4,19 @@ Use this if both laptops are on the same Wi-Fi.
 
 ## Normal Menu Flow
 
-Start the game on both laptops:
+Start the relay server on the host laptop first:
+
+```bash
+cd server
+npm install
+npm rebuild
+node server.js
+```
+
+If `better-sqlite3` is not rebuilt for your Node version, the server now falls
+back to in-memory auth so WebSocket multiplayer can still run.
+
+Then start the game on both laptops:
 
 ```bash
 python3 main.py
@@ -25,6 +37,7 @@ The game will try to find the host automatically on the local network.
 ## If Join Code Does Not Work
 
 If campus Wi-Fi blocks local discovery, type the host IP instead of the join code.
+The game will use port `3000` automatically.
 
 Find the host IP on the host laptop:
 
@@ -37,13 +50,13 @@ ipconfig getifaddr en0
 Host laptop:
 
 ```bash
-python3 main.py --host-session --name Presenter
+python3 main.py --host-session --name Presenter --port 3000
 ```
 
 Visitor laptop:
 
 ```bash
-python3 main.py --join HOST_IP --name Visitor
+python3 main.py --join HOST_IP --name Visitor --port 3000
 ```
 
 ## What Syncs

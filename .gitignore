@@ -219,6 +219,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Local QA renders
+qa/
+logs/
+
 # Codex
 .codex/
 # Node.js
@@ -234,4 +238,3 @@ logs/*.csv
 # Large binaries
 *.apk
 *.tar.gz
-

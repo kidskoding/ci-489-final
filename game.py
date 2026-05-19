@@ -38,7 +38,7 @@ SHIP_SEAM = (255, 65, 169)
 MODAL = (31, 220, 225)
 MODAL_TEXT = (10, 43, 52)
 BUTTON = (83, 178, 185)
-DEFAULT_PORT = 48900
+DEFAULT_PORT = 3000
 DISCOVERY_PORT = 48901
 JOIN_CODE = "CI-489-DEMO"
 
@@ -98,22 +98,98 @@ class CrewMember:
     ready: bool = False
 
 
+@dataclass(frozen=True)
+class LessonMode:
+    key: str
+    title: str
+    law: str
+    objective: str
+    description: str
+
+
+@dataclass
+class AreaCapture:
+    start_t: float
+    end_t: float
+    area: float
+    label: str
+
+
+@dataclass(frozen=True)
+class OrbitPreset:
+    name: str
+    semi_major_axis: float
+    period: float
+
+
+LESSON_MODES = {
+    "law1": LessonMode(
+        "law1",
+        "Orbit Shape Lab",
+        "Kepler's First Law",
+        "Change the orbit until the star sits at one focus, not the center.",
+        "Planet paths are ellipses. The star is at a focus, so higher eccentricity pushes the empty focus farther away.",
+    ),
+    "law2": LessonMode(
+        "law2",
+        "Equal Area Sweep",
+        "Kepler's Second Law",
+        "Capture two equal-time sweeps and compare the swept areas.",
+        "A line from the star to the planet sweeps out equal areas in equal times, even when the planet moves faster near perihelion.",
+    ),
+    "law3": LessonMode(
+        "law3",
+        "Period Ratio Lab",
+        "Kepler's Third Law",
+        "Compare worlds and find the constant T^2 / a^3 relationship.",
+        "The square of a planet's orbital period scales with the cube of its semi-major axis.",
+    ),
+    "tutorial": LessonMode(
+        "tutorial",
+        "Interactive Tutorial",
+        "Mission Training",
+        "Follow the highlighted prompts to learn the simulator.",
+        "Practice opening modes, selecting bodies, recording a measurement, and returning to the ship.",
+    ),
+}
+
+ORBIT_PRESETS = [
+    OrbitPreset("Mercury", 0.39, 0.24),
+    OrbitPreset("Earth", 1.00, 1.00),
+    OrbitPreset("Mars", 1.52, 1.88),
+    OrbitPreset("Jupiter", 5.20, 11.86),
+]
+
+
 class NetworkSession:
     def __init__(self, mode: str = "solo", host: str = "localhost:3000", port: int = DEFAULT_PORT, name: str = "Player") -> None:
         self.mode = mode
+        self.host = host
+        self.port = port
         self.name = name
         self.room = JOIN_CODE
         self.inbox = queue.Queue()
         self.running = False
         self.status = "Solo"
         self.ws = None
+        self.task = None
         self.player_names = [name]
 
         if mode in ["host", "join"]:
+            self.start()
+
+    def start(self) -> None:
+        if self.mode == "solo" or self.running:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.status = "Waiting for event loop"
+            return
+        else:
             self.running = True
             self.status = "Connecting..."
-            # For web, 'host' and 'join' both just connect to the relay server
-            asyncio.create_task(self._ws_loop(host))
+            self.task = loop.create_task(self._ws_loop(self.host))
 
     @property
     def connected(self) -> bool:
@@ -123,17 +199,25 @@ class NetworkSession:
         if self.mode == "solo" or not self.ws:
             return
         payload = json.dumps(message)
-        # We use a non-blocking way to send if possible, or just queue it
-        # For simplicity in this sync-to-async bridge:
-        asyncio.create_task(self.ws.send(payload))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self.ws.send(payload))
 
     async def _ws_loop(self, host: str) -> None:
         import websockets
-        # In browser/pygbag, we can try to get the host from the window location
+        host = self.normalize_host(host)
+
+        # In browser/pygbag, prefer an explicit relay query param, then the page host.
         try:
             import platform
+            params = platform.window.URLSearchParams.new(platform.window.location.search)
+            relay = params.get("relay")
+            if relay:
+                host = str(relay)
             window_host = platform.window.location.host
-            if window_host:
+            if not relay and window_host:
                 host = window_host
         except:
             pass
@@ -166,8 +250,28 @@ class NetworkSession:
             self.status = f"Error: {e}"
             self.running = False
 
+    def normalize_host(self, host: str) -> str:
+        clean = host.strip()
+        if clean.startswith("ws://"):
+            clean = clean.removeprefix("ws://")
+        elif clean.startswith("wss://"):
+            clean = clean.removeprefix("wss://")
+        clean = clean.rstrip("/")
+        if ":" not in clean:
+            clean = f"{clean}:{self.port}"
+        return clean
+
     def _handle_message(self, message: dict) -> None:
         m_type = message.get("type")
+        if m_type == "hello_ack":
+            name = str(message.get("name", self.name))
+            self.name = name
+            if self.player_names:
+                self.player_names = [name if existing == self.player_names[0] else existing for existing in self.player_names]
+            else:
+                self.player_names = [name]
+            self.inbox.put({"type": "hello_ack", "name": name})
+            return
         if m_type == "hello":
             name = message.get("name", "Unknown")
             if name not in self.player_names:
@@ -189,7 +293,9 @@ class NetworkSession:
 
     def close(self) -> None:
         self.running = False
-        # WS will close when loop ends
+        if self.task is not None:
+            self.task.cancel()
+            self.task = None
 
 
 def discover_host(join_code: str, timeout: float = 1.6) -> str | None:
@@ -244,6 +350,7 @@ class KeplerGame:
         self.ship_map = self.load_scaled(SHIP_MAP_PATH, (WIDTH, HEIGHT))
         self.prompt_icon = self.load_scaled(PROMPT_PATH, (66, 66))
         self.player_idle = self.load_scaled(PLAYER_IDLE_PATH, (52, 44))
+        self.player_walk = self.load_player_walk()
 
         self.panel_bg = self.load_scaled(PANEL_BG_PATH, (282, HEIGHT - 112))
         self.frame_bg = self.load_scaled(FRAME_BG_PATH, (704, 394))
@@ -258,6 +365,13 @@ class KeplerGame:
         self.transition_timer = 0.0
         self.transition_label = ""
         self.measure_flash = 0.0
+        self.lesson_progress = 0
+        self.lesson_success = False
+        self.lesson_buttons: dict[str, pygame.Rect] = {}
+        self.area_captures: list[AreaCapture] = []
+        self.law3_index = 1
+        self.tutorial_step = 0
+        self.tutorial_active = False
         self.multiplayer_timer = 0.0
         self.exit_menu_active = False
         self.position_sync_timer = 0.0
@@ -272,28 +386,49 @@ class KeplerGame:
         self.terminals = [
             Terminal(
                 "Crew Lounge",
-                pygame.Rect(158, 344, 92, 76),
+                pygame.Rect(104, 344, 92, 76),
                 "lounge",
                 "Gather here with your crew and press E when you are ready.",
                 (56, 189, 248),
             ),
             Terminal(
-                "Mars Observe",
-                pygame.Rect(312, 142, 144, 86),
-                "observe",
-                "Inspect orbital relationships and prior observations.",
+                "Training Sim",
+                pygame.Rect(304, 86, 132, 76),
+                "tutorial",
+                "Practice the core controls with guided prompts.",
+                (56, 189, 248),
+            ),
+            Terminal(
+                "Law 1 Lab",
+                pygame.Rect(488, 96, 124, 76),
+                "law1",
+                "Explore why planets follow ellipses with the star at one focus.",
                 (168, 85, 247),
             ),
             Terminal(
-                "Mars Measure",
-                pygame.Rect(678, 324, 146, 86),
+                "Law 2 Lab",
+                pygame.Rect(678, 150, 130, 78),
+                "law2",
+                "Capture equal-time orbital sweeps and compare areas.",
+                (244, 114, 182),
+            ),
+            Terminal(
+                "Law 3 Lab",
+                pygame.Rect(668, 334, 132, 78),
+                "law3",
+                "Compare period and orbit-size ratios across planets.",
+                (252, 196, 25),
+            ),
+            Terminal(
+                "Measure Bay",
+                pygame.Rect(292, 334, 132, 78),
                 "measure",
                 "Measure distances between the star, planet, foci, and apsides.",
                 (244, 114, 182),
             ),
             Terminal(
                 "Navigation Bay",
-                pygame.Rect(312, 318, 160, 122),
+                pygame.Rect(462, 328, 132, 102),
                 "ship",
                 "Return to the crew navigation map.",
                 (76, 217, 100),
@@ -316,7 +451,7 @@ class KeplerGame:
         name = self.player_name_input.strip() or self.crew[0].name
         name = "Host" if name == "Player" else name
         self.crew[0].name = name
-        self.network = NetworkSession("host", "127.0.0.1", DEFAULT_PORT, name)
+        self.network = NetworkSession("host", "127.0.0.1:3000", 3000, name)
         self.menu_active = False
         self.reset_presentation()
         self.notice = f"Hosting team {self.team_code}. Share IP {self.local_ip} with players."
@@ -326,14 +461,16 @@ class KeplerGame:
         if not code_or_host:
             return
         if code_or_host.upper() == JOIN_CODE:
-            host = discover_host(JOIN_CODE) or "127.0.0.1"
+            host = discover_host(JOIN_CODE) or "127.0.0.1:3000"
         else:
             host = code_or_host
+            if ":" not in host:
+                host = f"{host}:3000"
         self.network.close()
         name = self.player_name_input.strip() or self.crew[0].name
         name = "Visitor" if name == "Player" else name
         self.crew[0].name = name
-        self.network = NetworkSession("join", host, DEFAULT_PORT, name)
+        self.network = NetworkSession("join", host, 3000, name)
         self.menu_active = False
         self.reset_presentation()
         self.notice = f"Joining team {self.team_code}."
@@ -382,6 +519,9 @@ class KeplerGame:
     def apply_network_messages(self) -> None:
         for message in self.network.poll():
             message_type = message.get("type")
+            if message_type == "hello_ack":
+                self.crew[0].name = str(message.get("name", self.crew[0].name))
+                continue
             if message_type == "players":
                 players = [str(name) for name in message.get("players", [])]
                 self.sync_crew_names(players[:4])
@@ -487,11 +627,11 @@ class KeplerGame:
             self.screen.blit(font.render(line, True, color), (x, y))
 
     def draw_objective(self, text: str) -> None:
-        rect = pygame.Rect(18, 16, 338, 52)
+        rect = pygame.Rect(18, 18, 318, 48)
         self.draw_glow_rect(rect, PANEL, ACCENT, radius=10, alpha=238, width=1)
         prefix = self.micro.render("OBJECTIVE:", True, ACCENT)
-        self.screen.blit(prefix, (30, 25))
-        self.draw_wrapped(text, self.small, ACCENT, pygame.Rect(106, 22, 236, 40), line_gap=0)
+        self.screen.blit(prefix, (30, 27))
+        self.draw_wrapped(text, self.micro, ACCENT, pygame.Rect(106, 25, 216, 34), line_gap=0)
 
     def draw_nav_badge(self) -> None:
         center = (978, 38)
@@ -509,26 +649,26 @@ class KeplerGame:
         if compact:
             outer = pygame.Rect(42, HEIGHT - 104, WIDTH - 84, 78)
         else:
-            outer = pygame.Rect(38, HEIGHT - 150, WIDTH - 76, 124)
+            outer = pygame.Rect(48, HEIGHT - 126, WIDTH - 96, 102)
         pygame.draw.rect(self.screen, TEXT, outer, border_radius=28)
         inner = outer.inflate(-20 if compact else -24, -14 if compact else -20)
         self.draw_glow_rect(inner, PANEL, PANEL_LIGHT, radius=24, alpha=250, width=1)
         if speaker:
             tag = self.small.render(speaker.upper(), True, ACCENT)
-            self.screen.blit(tag, (inner.x + 24, inner.y + (8 if compact else 17)))
+            self.screen.blit(tag, (inner.x + 24, inner.y + (8 if compact else 12)))
             text_rect = pygame.Rect(
                 inner.x + 24,
-                inner.y + (32 if compact else 44),
+                inner.y + (32 if compact else 38),
                 inner.width - (116 if compact else 142),
-                inner.height - (38 if compact else 54),
+                inner.height - (38 if compact else 46),
             )
         else:
             text_rect = pygame.Rect(inner.x + 24, inner.y + 24, inner.width - 142, inner.height - 40)
         self.draw_wrapped(message, self.small if compact else self.font, TEXT, text_rect, line_gap=1 if compact else 2)
         arrow_x = inner.right - (56 if compact else 78)
         arrow_y = inner.centery
-        arrow_h = 30 if compact else 42
-        arrow_w = 22 if compact else 30
+        arrow_h = 30 if compact else 34
+        arrow_w = 22 if compact else 26
         pygame.draw.polygon(
             self.screen,
             (221, 255, 255),
@@ -569,17 +709,19 @@ class KeplerGame:
             header = f"HOSTING {self.team_code}"
         elif self.network.mode == "join":
             header = f"JOINED {self.team_code}"
-        self.screen.blit(self.small.render(header, True, ACCENT), (rect.x + 16, rect.y + 14))
-        y = rect.y + 42
+        self.screen.blit(self.micro.render(header, True, ACCENT), (rect.x + 14, rect.y + 12))
+        y = rect.y + 36
         for member in self.crew:
-            pygame.draw.circle(self.screen, member.color if member.joined else MUTED, (rect.x + 23, y + 9), 6)
+            pygame.draw.circle(self.screen, member.color if member.joined else MUTED, (rect.x + 20, y + 8), 5)
             name = member.name.upper()
-            self.screen.blit(self.micro.render(name, True, TEXT if member.joined else MUTED), (rect.x + 38, y + 2))
+            if len(name) > 12:
+                name = f"{name[:11]}..."
+            self.screen.blit(self.micro.render(name, True, TEXT if member.joined else MUTED), (rect.x + 34, y + 1))
             state = "READY" if member.ready else ("JOINED" if member.joined else "WAITING")
             state_color = ACCENT if member.ready else MUTED
             state_text = self.micro.render(state, True, state_color)
-            self.screen.blit(state_text, (rect.right - state_text.get_width() - 14, y + 2))
-            y += 23
+            self.screen.blit(state_text, (rect.right - state_text.get_width() - 12, y + 1))
+            y += 20
 
     def draw_start_menu(self) -> None:
         self.screen.fill((194, 199, 204))
@@ -703,6 +845,89 @@ class KeplerGame:
         end_pos = self.body_position_at_measurement(end, t)
         return (start_pos - end_pos).length()
 
+    def start_lesson_mode(self, mode: str) -> None:
+        self.mode = mode
+        self.selected = None
+        self.lesson_progress = 0
+        self.lesson_success = False
+        self.area_captures.clear()
+        self.lesson_buttons.clear()
+        self.tutorial_active = mode == "tutorial"
+        self.tutorial_step = 0
+        if mode == "law1":
+            self.paused = True
+            self.t = 0.08
+        elif mode == "law2":
+            self.paused = False
+            self.t = 0.94
+        elif mode == "law3":
+            self.paused = True
+            self.law3_index = 1
+        elif mode == "tutorial":
+            self.paused = False
+            self.t = 0.0
+
+    def current_lesson(self) -> LessonMode | None:
+        return LESSON_MODES.get(self.mode)
+
+    def adjust_orbit_shape(self, delta: float) -> None:
+        new_apoapsis = max(self.orbit.periapsis + 40, min(520, self.orbit.apoapsis + delta))
+        self.orbit = Orbit(apoapsis=new_apoapsis, periapsis=self.orbit.periapsis, argument_of_periapsis=self.orbit.argument_of_periapsis)
+        eccentricity = self.orbit.eccentricity
+        if eccentricity >= 0.48:
+            self.lesson_success = True
+            self.notice = f"First Law complete: eccentricity {eccentricity:.2f}. The star is clearly at one focus."
+        else:
+            self.notice = f"Eccentricity is {eccentricity:.2f}. Increase stretch until the empty focus separates from the star."
+
+    def capture_equal_time_area(self) -> None:
+        start_t = self.t
+        end_t = (self.t + 0.08) % 1.0
+        delta_t = (end_t - start_t) % 1.0
+        area = math.pi * self.orbit.semi_major_axis * self.orbit.semi_minor_axis * delta_t
+        label = "Near perihelion" if start_t > 0.86 or start_t < 0.14 else "Farther from star"
+        self.area_captures.append(AreaCapture(start_t, end_t, area, label))
+        if len(self.area_captures) > 2:
+            self.area_captures.pop(0)
+        if len(self.area_captures) == 2:
+            a, b = self.area_captures
+            difference = abs(a.area - b.area) / max(a.area, b.area)
+            self.lesson_success = difference < 0.12
+            verdict = "Second Law complete" if self.lesson_success else "Try captures farther apart on the orbit"
+            self.notice = f"{verdict}: equal-time area difference is {difference * 100:.1f}%."
+        else:
+            self.notice = "Captured one equal-time sweep. Let the planet move, then capture another."
+
+    def select_law3_preset(self, delta: int) -> None:
+        self.law3_index = (self.law3_index + delta) % len(ORBIT_PRESETS)
+        preset = ORBIT_PRESETS[self.law3_index]
+        self.lesson_success = self.law3_index == 2
+        if self.lesson_success:
+            self.notice = "Third Law complete: Mars still has T^2 / a^3 near 1.00."
+        else:
+            self.notice = f"Selected {preset.name}. Compare the ratio and find another world with the same constant."
+
+    def tutorial_message(self) -> str:
+        steps = [
+            "Step 1: click Red Dwarf to select the star.",
+            "Step 2: click Perihelion to record a star-to-perihelion distance.",
+            "Step 3: press Space to pause and resume the orbit.",
+            "Step 4: click the nav icon in the top-right when your team is ready to return.",
+        ]
+        if self.tutorial_step >= len(steps):
+            return "Tutorial complete. Try the three law labs from the ship."
+        return steps[self.tutorial_step]
+
+    def advance_tutorial(self, event_name: str) -> None:
+        expected = ["star", "measurement", "pause", "nav"]
+        if not self.tutorial_active or self.tutorial_step >= len(expected):
+            return
+        if expected[self.tutorial_step] != event_name:
+            return
+        self.tutorial_step += 1
+        self.lesson_success = self.tutorial_step >= len(expected)
+        self.notice = self.tutorial_message()
+
     def open_terminal(self, terminal: Terminal, broadcast: bool = True) -> None:
         if terminal.activity == "ship":
             self.screen_state = "ship"
@@ -738,6 +963,8 @@ class KeplerGame:
         self.interact_target = terminal
         self.active_terminal = terminal.name
         self.mode = terminal.activity
+        if terminal.activity in LESSON_MODES:
+            self.start_lesson_mode(terminal.activity)
         self.screen_state = "orbit"
         self.selected = None
         self.transition_timer = 0.75
@@ -755,7 +982,7 @@ class KeplerGame:
 
     def run_demo_step(self) -> None:
         if self.screen_state == "ship":
-            terminal = self.terminal_named("Mars Measure")
+            terminal = self.terminal_named("Measure Bay")
             self.player.update(terminal.rect.centerx, terminal.rect.centery + 50)
             self.open_terminal(terminal)
             return
@@ -799,6 +1026,12 @@ class KeplerGame:
         self.transition_timer = 0.0
         self.measure_flash = 0.0
         self.multiplayer_timer = 0.0
+        self.lesson_progress = 0
+        self.lesson_success = False
+        self.lesson_buttons.clear()
+        self.area_captures.clear()
+        self.tutorial_step = 0
+        self.tutorial_active = False
         self.player.update(279, 148)
         self.interact_target = None
         for i, member in enumerate(self.crew):
@@ -826,8 +1059,19 @@ class KeplerGame:
         elif self.screen_state == "ship":
             if event.key == pygame.K_ESCAPE:
                 self.running = False
+            elif event.key == pygame.K_t:
+                self.open_terminal(self.terminal_named("Training Sim"))
+            elif event.key == pygame.K_1:
+                self.open_terminal(self.terminal_named("Law 1 Lab"))
+            elif event.key == pygame.K_2:
+                self.open_terminal(self.terminal_named("Law 2 Lab"))
+            elif event.key == pygame.K_3:
+                self.open_terminal(self.terminal_named("Law 3 Lab"))
             else:
                 self.handle_ship_key(event)
+        elif event.key == pygame.K_TAB or event.key == pygame.K_q:
+            self.exit_menu_active = True
+            self.notice = "Review team readiness, then return to the ship."
         elif event.key == pygame.K_e:
             member = self.local_crew_member()
             member.ready = not member.ready
@@ -836,6 +1080,7 @@ class KeplerGame:
             self.notice = f"You are {status} to return to ship. Click the nav icon to toggle the status panel."
         elif event.key == pygame.K_SPACE:
             self.paused = not self.paused
+            self.advance_tutorial("pause")
         elif event.key == pygame.K_m:
             self.mode = "measure"
             self.selected = None
@@ -866,6 +1111,16 @@ class KeplerGame:
         elif event.key == pygame.K_BACKSPACE and self.measurements:
             self.measurements.pop()
             self.notice = "Deleted latest measurement."
+        elif self.mode == "law1" and event.key == pygame.K_RIGHTBRACKET:
+            self.adjust_orbit_shape(35)
+        elif self.mode == "law1" and event.key == pygame.K_LEFTBRACKET:
+            self.adjust_orbit_shape(-35)
+        elif self.mode == "law2" and event.key == pygame.K_c:
+            self.capture_equal_time_area()
+        elif self.mode == "law3" and event.key == pygame.K_RIGHTBRACKET:
+            self.select_law3_preset(1)
+        elif self.mode == "law3" and event.key == pygame.K_LEFTBRACKET:
+            self.select_law3_preset(-1)
 
     def handle_menu_key(self, event: pygame.event.Event) -> None:
         if event.key == pygame.K_ESCAPE:
@@ -959,6 +1214,7 @@ class KeplerGame:
         nav_center = (978, 38)
         if math.hypot(pos[0] - nav_center[0], pos[1] - nav_center[1]) <= 32:
             self.exit_menu_active = not self.exit_menu_active
+            self.advance_tutorial("nav")
             return
 
         # Check return to ship button in exit menu
@@ -982,10 +1238,35 @@ class KeplerGame:
                     self.notice = "Only the host can initiate return to ship."
             return
 
+        for action, rect in self.lesson_buttons.items():
+            if rect.collidepoint(pos):
+                if action == "law1_less":
+                    self.adjust_orbit_shape(-35)
+                elif action == "law1_more":
+                    self.adjust_orbit_shape(35)
+                elif action == "law2_capture":
+                    self.capture_equal_time_area()
+                elif action == "law3_prev":
+                    self.select_law3_preset(-1)
+                elif action == "law3_next":
+                    self.select_law3_preset(1)
+                return
+
         clicked = self.body_at(pos)
         if self.mode != "measure":
             if clicked:
+                if self.mode == "tutorial" and self.selected == "Red Dwarf" and clicked in ("Perihelion", "Exoplanet"):
+                    measurement_t = self.t
+                    distance = self.distance_between("Red Dwarf", "Perihelion", measurement_t)
+                    self.measurements.append(Measurement("Red Dwarf", "Perihelion", distance, measurement_t))
+                    self.measure_flash = 1.2
+                    self.selected = None
+                    self.advance_tutorial("measurement")
+                    return
                 self.notice = f"{clicked}: screen position {pos[0]}, {pos[1]}"
+                if self.mode == "tutorial" and clicked == "Red Dwarf":
+                    self.selected = clicked
+                    self.advance_tutorial("star")
             return
 
         if clicked is None:
@@ -1005,6 +1286,8 @@ class KeplerGame:
         self.measurements.append(Measurement(self.selected, clicked, distance, measurement_t))
         self.measure_flash = 1.2
         self.notice = f"Recorded {self.selected} to {clicked}: {distance:.1f} units."
+        if self.tutorial_active and {self.selected, clicked} == {"Red Dwarf", "Perihelion"}:
+            self.advance_tutorial("measurement")
         self.network.send({
             "type": "measurement",
             "start": start,
@@ -1101,6 +1384,68 @@ class KeplerGame:
     def draw_text(self, text: str, x: int, y: int, color: tuple[int, int, int] = TEXT) -> None:
         self.screen.blit(self.font.render(text, True, color), (x, y))
 
+    def draw_action_button(self, key: str, rect: pygame.Rect, label: str, active: bool = True) -> None:
+        color = ACCENT if active else MUTED
+        self.lesson_buttons[key] = rect
+        self.draw_glow_rect(rect, (16, 55, 68), color, radius=8, alpha=245, width=1)
+        text = self.small.render(label, True, TEXT if active else MUTED)
+        self.screen.blit(text, text.get_rect(center=rect.center))
+
+    def draw_law2_captures(self) -> None:
+        for capture in self.area_captures:
+            start = self.world_to_screen(self.orbit.point_at(capture.start_t))
+            end = self.world_to_screen(self.orbit.point_at(capture.end_t))
+            star = self.world_to_screen(Vec2(0, 0))
+            sweep = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            pygame.draw.polygon(sweep, (*MEASURE, 74), [star, start, end])
+            self.screen.blit(sweep, (0, 0))
+            pygame.draw.line(self.screen, MEASURE, star, start, 2)
+            pygame.draw.line(self.screen, MEASURE, star, end, 2)
+
+    def draw_lesson_panel(self, rect: pygame.Rect) -> None:
+        self.lesson_buttons.clear()
+        lesson = self.current_lesson()
+        if lesson is None:
+            return
+        self.draw_glow_rect(rect, PANEL, PANEL_LIGHT, radius=12, alpha=240, width=1)
+        self.screen.blit(self.micro.render(lesson.law.upper(), True, ACCENT), (rect.x + 18, rect.y + 14))
+        self.screen.blit(self.title.render(lesson.title, True, TEXT), (rect.x + 18, rect.y + 34))
+        self.draw_wrapped(lesson.objective, self.small, TEXT, pygame.Rect(rect.x + 18, rect.y + 72, rect.width - 36, 58), line_gap=1)
+        y = rect.y + 136
+
+        if self.mode == "law1":
+            e = self.orbit.eccentricity
+            self.draw_wrapped(lesson.description, self.micro, MUTED, pygame.Rect(rect.x + 18, y, rect.width - 36, 44), line_gap=0)
+            self.screen.blit(self.small.render(f"Eccentricity: {e:.2f}", True, ACCENT), (rect.x + 18, y + 54))
+            self.draw_action_button("law1_less", pygame.Rect(rect.x + 18, y + 84, 92, 34), "Less")
+            self.draw_action_button("law1_more", pygame.Rect(rect.x + 126, y + 84, 92, 34), "More")
+        elif self.mode == "law2":
+            self.draw_wrapped(lesson.description, self.micro, MUTED, pygame.Rect(rect.x + 18, y, rect.width - 36, 44), line_gap=0)
+            self.draw_action_button("law2_capture", pygame.Rect(rect.x + 18, y + 54, rect.width - 36, 38), "Capture sweep")
+            cy = y + 104
+            for capture in self.area_captures:
+                self.screen.blit(self.micro.render(f"{capture.label}: {capture.area:.0f}", True, TEXT), (rect.x + 18, cy))
+                cy += 18
+        elif self.mode == "law3":
+            preset = ORBIT_PRESETS[self.law3_index]
+            ratio = preset.period ** 2 / preset.semi_major_axis ** 3
+            self.draw_wrapped(lesson.description, self.micro, MUTED, pygame.Rect(rect.x + 18, y, rect.width - 36, 38), line_gap=0)
+            self.screen.blit(self.font.render(preset.name, True, TEXT), (rect.x + 18, y + 46))
+            self.screen.blit(self.small.render(f"a = {preset.semi_major_axis:.2f} AU", True, MUTED), (rect.x + 18, y + 78))
+            self.screen.blit(self.small.render(f"T = {preset.period:.2f} years", True, MUTED), (rect.x + 18, y + 104))
+            self.screen.blit(self.small.render(f"T^2 / a^3 = {ratio:.2f}", True, ACCENT), (rect.x + 18, y + 130))
+            self.draw_action_button("law3_prev", pygame.Rect(rect.x + 18, y + 162, 92, 32), "Prev")
+            self.draw_action_button("law3_next", pygame.Rect(rect.x + 126, y + 162, 92, 32), "Next")
+        elif self.mode == "tutorial":
+            self.draw_wrapped(self.tutorial_message(), self.font, TEXT, pygame.Rect(rect.x + 18, y, rect.width - 36, 82), line_gap=2)
+            progress = min(self.tutorial_step, 4)
+            self.screen.blit(self.small.render(f"Progress: {progress}/4", True, ACCENT), (rect.x + 18, y + 104))
+
+        if self.lesson_success:
+            complete = pygame.Rect(rect.x + 18, rect.bottom - 44, rect.width - 36, 30)
+            pygame.draw.rect(self.screen, (28, 96, 76), complete, border_radius=7)
+            self.screen.blit(self.micro.render("COMPLETE - return to ship or try another lab", True, TEXT), (complete.x + 10, complete.y + 8))
+
     def draw_scene(self) -> None:
         if self.menu_active:
             self.draw_start_menu()
@@ -1141,6 +1486,9 @@ class KeplerGame:
                     ghost = self.world_to_screen(self.orbit.point_at(m.t))
                     pygame.draw.circle(self.screen, (130, 150, 170), ghost, 10, 1)
 
+        if self.mode == "law2":
+            self.draw_law2_captures()
+
         bodies = self.bodies()
         label_offsets = {
             "Red Dwarf": (-44, 34),
@@ -1149,6 +1497,7 @@ class KeplerGame:
             "Focus": (18, -8),
             "Exoplanet": (20, -48),
         }
+        pending_labels = []
         for body in bodies.values():
             pos = self.world_to_screen(body.pos)
             if self.mode == "measure":
@@ -1162,7 +1511,21 @@ class KeplerGame:
                 pygame.draw.circle(self.screen, (255, 255, 255), pos, body.radius, 1)
             label = self.small.render(body.name, True, TEXT)
             offset = label_offsets.get(body.name, (body.radius + 6, -8))
-            self.screen.blit(label, (pos[0] + offset[0], pos[1] + offset[1]))
+            rect = label.get_rect(topleft=(pos[0] + offset[0], pos[1] + offset[1]))
+            pending_labels.append((label, rect))
+
+        placed_labels: list[pygame.Rect] = []
+        for label, rect in pending_labels:
+            rect = rect.copy()
+            for placed in placed_labels:
+                if rect.colliderect(placed.inflate(8, 4)):
+                    rect.y = placed.bottom + 5
+            rect.x = max(40, min(704 - rect.width, rect.x))
+            rect.y = max(100, min(466 - rect.height, rect.y))
+            bg = rect.inflate(8, 4)
+            pygame.draw.rect(self.screen, (5, 24, 35), bg, border_radius=4)
+            self.screen.blit(label, rect)
+            placed_labels.append(rect)
 
         if self.selected:
             selected = bodies[self.selected]
@@ -1174,7 +1537,7 @@ class KeplerGame:
         if self.screen_state == "ship":
             self.draw_objective("Interact with a door to find your fragment of the code.")
             self.draw_nav_badge()
-            self.draw_crew_status(pygame.Rect(742, 82, 248, 138))
+            self.draw_crew_status(pygame.Rect(790, 92, 204, 118))
             message = self.notice
             if self.interact_target:
                 message = f"{self.interact_target.name}: press E to open this console."
@@ -1182,22 +1545,35 @@ class KeplerGame:
             self.draw_transition_modal()
             return
 
-        objective = "Use the simulation console to compare orbital distances."
+        lesson = self.current_lesson()
+        objective = lesson.objective if lesson else "Use the simulation console to compare orbital distances."
         if self.interact_target:
             objective = self.interact_target.description
         self.draw_objective(objective)
         self.draw_nav_badge()
 
+        if lesson:
+            self.draw_lesson_panel(pygame.Rect(752, 92, 238, 380))
+            if self.measure_flash > 0 and self.measurements:
+                latest = self.measurements[-1]
+                banner = pygame.Rect(212, 82, 330, 48)
+                self.draw_glow_rect(banner, PANEL, MEASURE, radius=10, alpha=246, width=2)
+                text = f"Distance captured: {latest.distance:.1f} units"
+                self.screen.blit(self.small.render(text, True, TEXT), (banner.x + 22, banner.y + 14))
+            if self.exit_menu_active:
+                self.draw_exit_status_panel()
+            return
+
         status = pygame.Rect(752, 92, 238, 220)
         self.draw_glow_rect(status, PANEL, PANEL_LIGHT, radius=12, alpha=240, width=1)
         self.screen.blit(self.title.render(self.active_terminal, True, TEXT), (status.x + 20, status.y + 18))
-        self.draw_text(f"Mode: {self.mode.title()}", status.x + 20, status.y + 64, ACCENT)
-        self.draw_text(f"Orbit t: {self.t:.3f}", status.x + 20, status.y + 96, MUTED)
-        self.draw_text("Paused" if self.paused else "Running", status.x + 20, status.y + 126, MUTED)
+        self.screen.blit(self.font.render(f"Mode: {self.mode.title()}", True, ACCENT), (status.x + 20, status.y + 62))
+        self.screen.blit(self.small.render(f"Orbit t: {self.t:.3f}", True, MUTED), (status.x + 20, status.y + 96))
+        self.screen.blit(self.small.render("Paused" if self.paused else "Running", True, MUTED), (status.x + 20, status.y + 122))
         ready = sum(member.ready for member in self.crew)
-        self.draw_text(f"Team ready: {ready}/{len(self.crew)}", status.x + 20, status.y + 152, ACCENT)
+        self.screen.blit(self.font.render(f"Team ready: {ready}/{len(self.crew)}", True, ACCENT), (status.x + 20, status.y + 146))
         controls = "Tab return  Space pause\nM measure  O observe  +/- zoom"
-        self.draw_wrapped(controls, self.micro, MUTED, pygame.Rect(status.x + 20, status.y + 176, status.width - 40, 34), line_gap=0)
+        self.draw_wrapped(controls, self.micro, MUTED, pygame.Rect(status.x + 20, status.y + 178, status.width - 40, 34), line_gap=0)
 
         log = pygame.Rect(752, 330, 238, 142)
         self.draw_glow_rect(log, PANEL, PANEL_LIGHT, radius=12, alpha=230, width=1)
@@ -1288,13 +1664,16 @@ class KeplerGame:
             self.screen.blit(label, label_rect)
             if self.interact_target == terminal and terminal.name != "Navigation Bay":
                 pygame.draw.rect(self.screen, terminal.color, terminal.rect.inflate(8, 8), 3, border_radius=8)
+                prompt_center = (terminal.rect.centerx, terminal.rect.y - 56)
+                if terminal.rect.y < 150:
+                    prompt_center = (terminal.rect.right + 34, terminal.rect.y + 20)
                 if self.prompt_icon:
-                    prompt_rect = self.prompt_icon.get_rect(center=(terminal.rect.centerx, terminal.rect.y - 56))
+                    prompt_rect = self.prompt_icon.get_rect(center=prompt_center)
                     self.screen.blit(self.prompt_icon, prompt_rect)
                 else:
                     prompt = self.font.render("E", True, BACKGROUND)
-                    pygame.draw.circle(self.screen, TEXT, (terminal.rect.centerx, terminal.rect.y - 56), 17)
-                    self.screen.blit(prompt, prompt.get_rect(center=(terminal.rect.centerx, terminal.rect.y - 56)))
+                    pygame.draw.circle(self.screen, TEXT, prompt_center, 17)
+                    self.screen.blit(prompt, prompt.get_rect(center=prompt_center))
 
         self.draw_remote_crew()
 
@@ -1321,6 +1700,7 @@ class KeplerGame:
             self.notice = f"{self.interact_target.name}: press E to open."
 
     async def run(self) -> None:
+        self.network.start()
         while self.running:
             dt = self.clock.tick(FPS) / 1000.0
             for event in pygame.event.get():
@@ -1349,13 +1729,23 @@ def main() -> None:
     args = parser.parse_args()
 
     mode = "menu"
-    host = "127.0.0.1"
+    host = "127.0.0.1:3000"
+    port = 3000
     if args.host_session:
         mode = "host"
     elif args.join:
         mode = "join"
         host = args.join
-    asyncio.run(KeplerGame(mode, host, args.port, args.name).run())
+
+    if ":" not in host:
+        host = f"{host}:{args.port}"
+    port = args.port
+
+    async def runner() -> None:
+        game = KeplerGame(mode, host, port, args.name)
+        await game.run()
+
+    asyncio.run(runner())
 
 
 def demo_check() -> str:

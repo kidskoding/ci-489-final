@@ -32,15 +32,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pygbag websockets
+          pip install -r requirements-build.txt
 
       - name: Build Web Version
         run: |
           mkdir -p /tmp/kepler-path-web
-          cp main.py game.py orbit.py requirements.txt /tmp/kepler-path-web/
+          cp main.py game.py orbit.py requirements.txt requirements-build.txt Makefile /tmp/kepler-path-web/
           cp -R assets /tmp/kepler-path-web/assets
           cd /tmp/kepler-path-web
-          python -m pygbag --build --disable-sound-format-error main.py
+          make web
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

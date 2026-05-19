@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: kepler-path-relay
+    runtime: node
+    rootDir: server
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: JWT_SECRET
+        generateValue: true
+      - key: GAME_URL
+        value: https://kidskoding.github.io/ci-489-final/
+      - key: ENABLE_DISCOVERY
+        value: "false"
