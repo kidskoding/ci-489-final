@@ -238,3 +238,4 @@ logs/*.csv
 # Large binaries
 *.apk
 *.tar.gz
+!server/public/game/*.tar.gz
