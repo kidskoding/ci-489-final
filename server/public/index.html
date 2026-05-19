@@ -2,104 +2,40 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kepler Path - Login</title>
+    <title>Kepler Path - Simulation</title>
     <style>
-        body {
-            background: #061822;
-            color: #f4fbfd;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
-            overflow: hidden;
-        }
-        .container {
+        body { margin: 0; background: #061822; overflow: hidden; font-family: sans-serif; }
+        #header {
+            height: 50px;
             background: #082b38;
-            padding: 2.5rem;
-            border-radius: 15px;
-            border: 2px solid #1cebf4;
-            box-shadow: 0 0 25px rgba(28, 235, 244, 0.2);
-            width: 350px;
-            text-align: center;
+            display: flex;
+            align-items: center;
+            padding: 0 20px;
+            border-bottom: 2px solid #1cebf4;
+            color: #1cebf4;
+            justify-content: space-between;
         }
-        h1 { margin-top: 0; color: #1cebf4; letter-spacing: 2px; }
-        input {
-            width: 100%;
-            padding: 12px;
-            margin: 10px 0;
-            background: #0a2b34;
-            border: 1px solid #71e8eb;
-            color: white;
-            border-radius: 5px;
-            box-sizing: border-box;
-        }
-        button {
-            width: 100%;
-            padding: 12px;
-            margin: 10px 0;
-            background: #53b2b9;
+        iframe {
+            width: 100vw;
+            height: calc(100vh - 52px);
             border: none;
-            color: white;
-            font-weight: bold;
-            cursor: pointer;
-            border-radius: 5px;
-            transition: 0.3s;
         }
-        button:hover { background: #1cebf4; color: #061822; }
-        .toggle { font-size: 0.9rem; color: #84aaa2; cursor: pointer; text-decoration: underline; }
-        #error { color: #ff41a9; font-size: 0.9rem; margin-top: 10px; }
+        .user-info { color: #f4fbfd; font-size: 0.9rem; }
+        .logout { color: #84aaa2; cursor: pointer; margin-left: 15px; text-decoration: underline; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>KEPLER PATH</h1>
-        <div id="form-title">Login</div>
-        <input type="text" id="username" placeholder="Username">
-        <input type="password" id="password" placeholder="Password">
-        <button id="main-btn" onclick="handleSubmit()">Login</button>
-        <div class="toggle" id="toggle-link" onclick="toggleMode()">Need an account? Register</div>
-        <div id="error"></div>
+    <div id="header">
+        <div>KEPLER PATH :: MISSION CONTROL</div>
     </div>
+    <!-- The iframe loads the pygbag build and passes this backend as the WebSocket relay. -->
+    <iframe id="game-frame" title="Kepler Path Simulation"></iframe>
 
     <script>
-        let mode = 'login';
-        function toggleMode() {
-            mode = mode === 'login' ? 'register' : 'login';
-            document.getElementById('form-title').innerText = mode.charAt(0).toUpperCase() + mode.slice(1);
-            document.getElementById('main-btn').innerText = mode.charAt(0).toUpperCase() + mode.slice(1);
-            document.getElementById('toggle-link').innerText = mode === 'login' ? 'Need an account? Register' : 'Have an account? Login';
-        }
-
-        async function handleSubmit() {
-            const username = document.getElementById('username').value;
-            const password = document.getElementById('password').value;
-            const errorDiv = document.getElementById('error');
-            errorDiv.innerText = '';
-
-            const endpoint = mode === 'login' ? '/api/login' : '/api/register';
-            const response = await fetch(endpoint, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username, password })
-            });
-
-            const data = await response.json();
-            if (data.success) {
-                if (mode === 'register') {
-                    alert('Registration successful! Please login.');
-                    toggleMode();
-                } else {
-                    localStorage.setItem('token', data.token);
-                    localStorage.setItem('username', username);
-                    window.location.href = '/play.html';
-                }
-            } else {
-                errorDiv.innerText = data.error || 'Something went wrong';
-            }
-        }
+        const gameFrame = document.getElementById('game-frame');
+        const gameUrl = new URL('/game/', window.location.origin);
+        gameUrl.searchParams.set('relay', window.location.host);
+        gameFrame.src = gameUrl.toString();
     </script>
 </body>
 </html>
