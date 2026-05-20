@@ -41,6 +41,7 @@ BUTTON = (83, 178, 185)
 DEFAULT_PORT = 3000
 DISCOVERY_PORT = 48901
 JOIN_CODE = "CI-489-DEMO"
+RELAY_HOST = "ci-489-final.onrender.com"
 
 
 ASSET_ROOT = Path(__file__).resolve().parent / "assets"
@@ -227,16 +228,17 @@ class NetworkSession:
         import websockets
         host = self.normalize_host(host)
 
-        # In browser/pygbag, prefer an explicit relay query param, then the page host.
+        # In browser/pygbag, allow a relay query param to override the configured host.
+        # If no host was configured, fall back to same-origin for self-hosted builds.
         try:
             import platform
             params = platform.window.URLSearchParams.new(platform.window.location.search)
             relay = params.get("relay")
             if relay:
-                host = str(relay)
+                host = self.normalize_host(str(relay))
             window_host = platform.window.location.host
-            if not relay and window_host:
-                host = window_host
+            if not relay and not host and window_host:
+                host = self.normalize_host(str(window_host))
         except:
             pass
 
@@ -270,13 +272,16 @@ class NetworkSession:
 
     def normalize_host(self, host: str) -> str:
         clean = host.strip()
+        if not clean:
+            return clean
         if clean.startswith("ws://"):
             clean = clean.removeprefix("ws://")
         elif clean.startswith("wss://"):
             clean = clean.removeprefix("wss://")
         clean = clean.rstrip("/")
         if ":" not in clean:
-            clean = f"{clean}:{self.port}"
+            is_ipv4 = clean.replace(".", "").isdigit()
+            clean = clean if "." in clean and not is_ipv4 else f"{clean}:{self.port}"
         return clean
 
     def _handle_message(self, message: dict) -> None:
@@ -317,6 +322,8 @@ class NetworkSession:
 
 
 def discover_host(join_code: str, timeout: float = 1.6) -> str | None:
+    if is_browser_runtime():
+        return None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -335,6 +342,14 @@ def discover_host(join_code: str, timeout: float = 1.6) -> str | None:
     if text.startswith(f"HOLOORBIT_HOST:{join_code}:"):
         return addr[0]
     return None
+
+
+def is_browser_runtime() -> bool:
+    try:
+        import platform
+        return hasattr(platform, "window")
+    except Exception:
+        return False
 
 
 class KeplerGame:
@@ -482,7 +497,7 @@ class KeplerGame:
         if not code_or_host:
             return
         if code_or_host.upper() == JOIN_CODE:
-            host = discover_host(JOIN_CODE) or "ci-489-final.onrender.com"
+            host = discover_host(JOIN_CODE) or RELAY_HOST
         else:
             host = code_or_host
             if ":" not in host:

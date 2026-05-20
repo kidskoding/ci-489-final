@@ -1,11 +1,13 @@
 import os
+import sys
+import types
 import pytest
 import pygame
 
 # Use dummy video driver for headless testing
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 
-from game import KeplerGame, NetworkSession, TUTORIAL_STEPS
+from game import JOIN_CODE, RELAY_HOST, KeplerGame, NetworkSession, TUTORIAL_STEPS, discover_host
 
 def test_game_initialization():
     game = KeplerGame(multiplayer_mode="solo")
@@ -45,9 +47,33 @@ def test_network_session_can_be_constructed_before_event_loop():
 
     assert session.status == "Waiting for event loop"
     assert session.normalize_host("127.0.0.1") == "127.0.0.1:3000"
+    assert session.normalize_host(RELAY_HOST) == RELAY_HOST
     assert session.normalize_host("ws://127.0.0.1:3000/") == "127.0.0.1:3000"
 
     session.close()
+
+
+def test_discover_host_skips_udp_in_browser_runtime(monkeypatch):
+    monkeypatch.setitem(sys.modules, "platform", types.SimpleNamespace(window=object()))
+
+    assert discover_host(JOIN_CODE) is None
+
+
+def test_join_code_uses_render_relay_when_discovery_unavailable(monkeypatch):
+    import game as game_module
+
+    monkeypatch.setattr(game_module, "discover_host", lambda join_code: None)
+    game = KeplerGame(multiplayer_mode="solo")
+    game.join_ip = JOIN_CODE
+    game.player_name_input = "Visitor"
+
+    game.start_join_game()
+
+    assert game.network.host == RELAY_HOST
+    assert game.menu_active is False
+
+    game.network.close()
+    pygame.quit()
 
 def test_network_session_applies_server_assigned_unique_name():
     session = NetworkSession("host", "127.0.0.1", 3000, "Player")
