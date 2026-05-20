@@ -317,9 +317,12 @@ class NetworkSession:
 
 
 def discover_host(join_code: str, timeout: float = 1.6) -> str | None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.settimeout(timeout)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(timeout)
+    except OSError:
+        return None
     try:
         payload = f"HOLOORBIT_DISCOVER:{join_code}".encode("utf-8")
         sock.sendto(payload, ("255.255.255.255", DISCOVERY_PORT))
@@ -479,7 +482,7 @@ class KeplerGame:
         if not code_or_host:
             return
         if code_or_host.upper() == JOIN_CODE:
-            host = discover_host(JOIN_CODE) or "127.0.0.1:3000"
+            host = discover_host(JOIN_CODE) or "ci-489-final.onrender.com"
         else:
             host = code_or_host
             if ":" not in host:
