@@ -3,6 +3,6 @@ services:
     name: kepler-path-relay
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements-relay.txt
     startCommand: python server.py
     healthCheckPath: /healthz
