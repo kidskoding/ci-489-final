@@ -227,6 +227,9 @@ logs/
 
 # Codex
 .codex/
+
+# Claude Code local config
+.claude/
 # Node.js
 node_modules/
 npm-debug.log*
@@ -240,4 +243,3 @@ logs/*.csv
 # Large binaries
 *.apk
 *.tar.gz
-!server/public/game/*.tar.gz
