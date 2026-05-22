@@ -243,3 +243,5 @@ logs/*.csv
 # Large binaries
 *.apk
 *.tar.gz
+
+graphify-out/
