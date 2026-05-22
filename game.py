@@ -321,6 +321,149 @@ class NetworkSession:
             self.task = None
 
 
+class LocalRelayServer:
+    def __init__(self, port: int = DEFAULT_PORT, join_code: str = JOIN_CODE) -> None:
+        self.port = port
+        self.join_code = join_code
+        self.rooms: dict[str, set] = {}
+        self.ready = threading.Event()
+        self.stop_requested = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.error: str | None = None
+
+    def start(self) -> bool:
+        if is_browser_runtime():
+            self.error = "Local relay is unavailable in browser builds."
+            return False
+        if self.thread and self.thread.is_alive():
+            return True
+        self.stop_requested.clear()
+        self.ready.clear()
+        self.error = None
+        self.thread = threading.Thread(target=self._run_thread, daemon=True)
+        self.thread.start()
+        self.ready.wait(1.5)
+        return self.error is None and self.ready.is_set()
+
+    def stop(self) -> None:
+        self.stop_requested.set()
+
+    def _run_thread(self) -> None:
+        try:
+            asyncio.run(self._serve())
+        except Exception as exc:
+            self.error = str(exc)
+            self.ready.set()
+
+    def room_players(self, room_code: str) -> list[str]:
+        if room_code not in self.rooms:
+            return []
+        return [
+            ws.player_name
+            for ws in self.rooms[room_code]
+            if getattr(ws, "player_name", None)
+        ]
+
+    def unique_player_name(self, room_code: str, requested: str, ws) -> str:
+        base = (requested or "Player").strip() or "Player"
+        existing = set(self.room_players(room_code)) - {getattr(ws, "player_name", None)}
+        max_length = 24
+        first_choice = base[:max_length]
+        if first_choice not in existing:
+            return first_choice
+
+        suffix = 2
+        while True:
+            suffix_text = f" {suffix}"
+            candidate = f"{base[:max_length - len(suffix_text)]}{suffix_text}"
+            if candidate not in existing:
+                return candidate
+            suffix += 1
+
+    async def broadcast(self, room_code: str, message: dict, exclude=None) -> None:
+        if room_code not in self.rooms:
+            return
+        payload = json.dumps(message)
+        targets = [ws for ws in self.rooms[room_code] if ws is not exclude]
+        if targets:
+            await asyncio.gather(*[ws.send(payload) for ws in targets], return_exceptions=True)
+
+    async def broadcast_roster(self, room_code: str) -> None:
+        await self.broadcast(room_code, {"type": "players", "players": self.room_players(room_code)[:4]})
+
+    async def handler(self, ws) -> None:
+        ws.player_name = None
+        current_room = None
+
+        try:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = msg.get("type")
+                if msg_type == "join":
+                    room = str(msg.get("room", self.join_code)).strip()[:64] or self.join_code
+                    current_room = room
+                    if current_room not in self.rooms:
+                        self.rooms[current_room] = set()
+                    self.rooms[current_room].add(ws)
+                    await ws.send(json.dumps({"type": "players", "players": self.room_players(current_room)[:4]}))
+                elif msg_type == "hello":
+                    if current_room is None:
+                        continue
+                    name = self.unique_player_name(current_room, str(msg.get("name", "Player")), ws)
+                    ws.player_name = name
+                    await ws.send(json.dumps({"type": "hello_ack", "name": name}))
+                    await self.broadcast_roster(current_room)
+                elif current_room and current_room in self.rooms:
+                    await self.broadcast(current_room, msg, exclude=ws)
+        except Exception:
+            pass
+        finally:
+            if current_room and current_room in self.rooms:
+                self.rooms[current_room].discard(ws)
+                if self.rooms[current_room]:
+                    await self.broadcast_roster(current_room)
+                else:
+                    del self.rooms[current_room]
+
+    async def _serve(self) -> None:
+        import websockets
+
+        discovery_thread = threading.Thread(target=self._run_discovery, daemon=True)
+        discovery_thread.start()
+        try:
+            async with websockets.serve(self.handler, "0.0.0.0", self.port):
+                self.ready.set()
+                while not self.stop_requested.is_set():
+                    await asyncio.sleep(0.1)
+        except OSError as exc:
+            self.error = str(exc)
+            self.ready.set()
+
+    def _run_discovery(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", DISCOVERY_PORT))
+            sock.settimeout(0.5)
+            while not self.stop_requested.is_set():
+                try:
+                    data, addr = sock.recvfrom(1024)
+                except socket.timeout:
+                    continue
+                text = data.decode("utf-8", errors="ignore")
+                if text == f"HOLOORBIT_DISCOVER:{self.join_code}":
+                    response = f"HOLOORBIT_HOST:{self.join_code}:{self.port}".encode("utf-8")
+                    sock.sendto(response, addr)
+        except OSError:
+            pass
+        finally:
+            sock.close()
+
+
 def discover_host(join_code: str, timeout: float = 1.6) -> str | None:
     if is_browser_runtime():
         return None
@@ -340,6 +483,9 @@ def discover_host(join_code: str, timeout: float = 1.6) -> str | None:
         sock.close()
     text = data.decode("utf-8", errors="ignore")
     if text.startswith(f"HOLOORBIT_HOST:{join_code}:"):
+        port = text.rsplit(":", 1)[-1]
+        if port.isdigit():
+            return f"{addr[0]}:{port}"
         return addr[0]
     return None
 
@@ -376,6 +522,9 @@ class KeplerGame:
         self.join_ip = ""
         self.menu_input_focused = False
         self.local_ip = self.detect_local_ip()
+        self.default_host = host
+        self.default_port = port
+        self.local_relay: LocalRelayServer | None = None
         self.screen_state = "ship"
         self.mode = "play"
         self.selected: str | None = None
@@ -412,6 +561,10 @@ class KeplerGame:
         self.exit_menu_active = False
         self.position_sync_timer = 0.0
         self.team_code = JOIN_CODE
+        if multiplayer_mode == "host" and not is_browser_runtime():
+            self.local_relay = LocalRelayServer(self.default_port, self.team_code)
+            if self.local_relay.start():
+                host = f"127.0.0.1:{self.default_port}"
         self.network = NetworkSession(multiplayer_mode, host, port, player_name)
         self.crew = [
             CrewMember(player_name, "Navigator", ACCENT, (279, 148), joined=True, ready=True),
@@ -484,29 +637,49 @@ class KeplerGame:
 
     def start_host_game(self) -> None:
         self.network.close()
+        if self.local_relay is not None:
+            self.local_relay.stop()
+            self.local_relay = None
         name = self.player_name_input.strip() or self.crew[0].name
         name = "Host" if name == "Player" else name
         self.crew[0].name = name
-        self.network = NetworkSession("host", "127.0.0.1:3000", 3000, name)
+        host = self.default_host
+        if not is_browser_runtime():
+            self.local_relay = LocalRelayServer(self.default_port, self.team_code)
+            if self.local_relay.start():
+                host = f"127.0.0.1:{self.default_port}"
+            else:
+                host = f"127.0.0.1:{self.default_port}"
+                self.notice = f"Could not start local relay: {self.local_relay.error}"
+        self.network = NetworkSession("host", host, self.default_port, name)
         self.menu_active = False
         self.reset_presentation()
-        self.notice = f"Hosting team {self.team_code}. Share IP {self.local_ip} with players."
+        if self.local_relay and self.local_relay.error:
+            self.notice = f"Hosting client started, but local relay failed: {self.local_relay.error}"
+        elif is_browser_runtime():
+            self.notice = f"Hosting team {self.team_code} on the web relay."
+        else:
+            self.notice = f"Hosting team {self.team_code}. Other players can enter {JOIN_CODE} or IP {self.local_ip}."
 
     def start_join_game(self) -> None:
         code_or_host = self.join_ip.strip()
         if not code_or_host:
             return
+        if self.local_relay is not None:
+            self.local_relay.stop()
+            self.local_relay = None
         if code_or_host.upper() == JOIN_CODE:
-            host = discover_host(JOIN_CODE) or RELAY_HOST
+            fallback_host = self.default_host if is_browser_runtime() else RELAY_HOST
+            host = discover_host(JOIN_CODE) or fallback_host
         else:
             host = code_or_host
             if ":" not in host:
-                host = f"{host}:3000"
+                host = f"{host}:{self.default_port}"
         self.network.close()
         name = self.player_name_input.strip() or self.crew[0].name
         name = "Visitor" if name == "Player" else name
         self.crew[0].name = name
-        self.network = NetworkSession("join", host, 3000, name)
+        self.network = NetworkSession("join", host, self.default_port, name)
         self.menu_active = False
         self.reset_presentation()
         self.notice = f"Joining team {self.team_code}."
@@ -1826,6 +1999,9 @@ class KeplerGame:
             pygame.display.flip()
             await asyncio.sleep(0)
         self.network.close()
+        if self.local_relay is not None:
+            self.local_relay.stop()
+            self.local_relay = None
         pygame.quit()
 
 

@@ -16,7 +16,7 @@ const PORT = process.env.PORT || 3000;
 const JOIN_CODE = process.env.JOIN_CODE || 'CI-489-DEMO';
 const DISCOVERY_PORT = Number(process.env.DISCOVERY_PORT || 48901);
 const GAME_URL = process.env.GAME_URL || 'https://kidskoding.github.io/ci-489-final/';
-const ENABLE_DISCOVERY = process.env.ENABLE_DISCOVERY === 'true';
+const ENABLE_DISCOVERY = process.env.ENABLE_DISCOVERY !== 'false';
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -30,9 +30,37 @@ app.get('/config.js', (req, res) => {
   res.send(`window.KEPLER_CONFIG = ${JSON.stringify({ gameUrl: GAME_URL })};`);
 });
 
+function cleanString(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function cleanRoomCode(value) {
+  const room = cleanString(value).slice(0, 64);
+  return room || JOIN_CODE;
+}
+
+function validateCredentials(body) {
+  const username = cleanString(body?.username);
+  const password = typeof body?.password === 'string' ? body.password : '';
+
+  if (username.length < 3 || username.length > 32) {
+    return { error: 'Username must be 3-32 characters.' };
+  }
+  if (password.length < 4 || password.length > 128) {
+    return { error: 'Password must be 4-128 characters.' };
+  }
+
+  return { username, password };
+}
+
 // Auth APIs
 app.post('/api/register', (req, res) => {
-  const { username, password } = req.body;
+  const credentials = validateCredentials(req.body);
+  if (credentials.error) {
+    return res.status(400).json({ error: credentials.error });
+  }
+
+  const { username, password } = credentials;
   const hash = bcrypt.hashSync(password, 10);
   try {
     const info = db.prepare('INSERT INTO users (username, password) VALUES (?, ?)').run(username, hash);
@@ -43,7 +71,12 @@ app.post('/api/register', (req, res) => {
 });
 
 app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
+  const credentials = validateCredentials(req.body);
+  if (credentials.error) {
+    return res.status(400).json({ error: credentials.error });
+  }
+
+  const { username, password } = credentials;
   const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
   if (user && bcrypt.compareSync(password, user.password)) {
     const token = jwt.sign({ id: user.id, username: user.username }, SECRET, { expiresIn: '24h' });
@@ -66,17 +99,24 @@ function roomPlayers(roomCode) {
 }
 
 function uniquePlayerName(roomCode, requestedName, ws) {
-  const base = String(requestedName || 'Player').trim() || 'Player';
+  const base = cleanString(requestedName) || 'Player';
   const existing = new Set(roomPlayers(roomCode).filter(name => name !== ws.playerName));
-  if (!existing.has(base)) {
-    return base;
+  const maxLength = 24;
+  const firstChoice = base.slice(0, maxLength);
+
+  if (!existing.has(firstChoice)) {
+    return firstChoice;
   }
 
   let suffix = 2;
-  while (existing.has(`${base} ${suffix}`)) {
+  let candidate;
+  do {
+    const suffixText = ` ${suffix}`;
+    candidate = `${base.slice(0, maxLength - suffixText.length)}${suffixText}`;
     suffix += 1;
-  }
-  return `${base} ${suffix}`;
+  } while (existing.has(candidate));
+
+  return candidate;
 }
 
 function broadcast(roomCode, message, exclude = null) {
@@ -103,7 +143,7 @@ wss.on('connection', (ws, req) => {
       
       // Basic Handshake to join a room
       if (msg.type === 'join') {
-        currentRoom = msg.room;
+        currentRoom = cleanRoomCode(msg.room);
         if (!rooms.has(currentRoom)) {
           rooms.set(currentRoom, new Set());
         }
@@ -113,7 +153,7 @@ wss.on('connection', (ws, req) => {
       }
 
       if (msg.type === 'hello') {
-        const assigned = uniquePlayerName(currentRoom, msg.name, ws).slice(0, 24);
+        const assigned = uniquePlayerName(currentRoom, msg.name, ws);
         ws.playerName = assigned;
         ws.send(JSON.stringify({ type: 'hello_ack', name: assigned }));
         if (currentRoom) {

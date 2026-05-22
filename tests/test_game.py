@@ -59,6 +59,33 @@ def test_discover_host_skips_udp_in_browser_runtime(monkeypatch):
     assert discover_host(JOIN_CODE) is None
 
 
+def test_discover_host_returns_advertised_relay_port(monkeypatch):
+    import game as game_module
+
+    class FakeSocket:
+        def setsockopt(self, *args):
+            pass
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def sendto(self, payload, address):
+            self.payload = payload
+            self.address = address
+
+        def recvfrom(self, size):
+            return f"HOLOORBIT_HOST:{JOIN_CODE}:3107".encode("utf-8"), ("192.168.1.44", 48901)
+
+        def close(self):
+            self.closed = True
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(game_module, "is_browser_runtime", lambda: False)
+    monkeypatch.setattr(game_module.socket, "socket", lambda *args, **kwargs: fake_socket)
+
+    assert discover_host(JOIN_CODE) == "192.168.1.44:3107"
+
+
 def test_join_code_uses_render_relay_when_discovery_unavailable(monkeypatch):
     import game as game_module
 
@@ -74,6 +101,41 @@ def test_join_code_uses_render_relay_when_discovery_unavailable(monkeypatch):
 
     game.network.close()
     pygame.quit()
+
+
+def test_local_host_game_starts_embedded_relay(monkeypatch):
+    import game as game_module
+
+    started = []
+
+    class FakeRelay:
+        error = None
+
+        def __init__(self, port, join_code):
+            self.port = port
+            self.join_code = join_code
+
+        def start(self):
+            started.append((self.port, self.join_code))
+            return True
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(game_module, "is_browser_runtime", lambda: False)
+    monkeypatch.setattr(game_module, "LocalRelayServer", FakeRelay)
+
+    game = KeplerGame(multiplayer_mode="solo", host="ci-489-final.onrender.com", port=3000)
+    game.player_name_input = "Presenter"
+    game.start_host_game()
+
+    assert started == [(3000, JOIN_CODE)]
+    assert game.network.mode == "host"
+    assert game.network.host == "127.0.0.1:3000"
+
+    game.network.close()
+    pygame.quit()
+
 
 def test_network_session_applies_server_assigned_unique_name():
     session = NetworkSession("host", "127.0.0.1", 3000, "Player")

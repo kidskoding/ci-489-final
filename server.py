@@ -30,12 +30,17 @@ def room_players(room_code: str) -> list[str]:
 def unique_player_name(room_code: str, requested: str, ws) -> str:
     base = (requested or "Player").strip() or "Player"
     existing = set(room_players(room_code)) - {getattr(ws, "player_name", None)}
-    if base not in existing:
-        return base
+    max_length = 24
+    first_choice = base[:max_length]
+    if first_choice not in existing:
+        return first_choice
     suffix = 2
-    while f"{base} {suffix}" in existing:
+    while True:
+        suffix_text = f" {suffix}"
+        candidate = f"{base[:max_length - len(suffix_text)]}{suffix_text}"
+        if candidate not in existing:
+            return candidate
         suffix += 1
-    return f"{base} {suffix}"
 
 
 async def broadcast(room_code: str, message: dict, exclude=None) -> None:
@@ -65,7 +70,7 @@ async def handler(ws) -> None:
             msg_type = msg.get("type")
 
             if msg_type == "join":
-                current_room = msg.get("room", JOIN_CODE)
+                current_room = str(msg.get("room", JOIN_CODE)).strip()[:64] or JOIN_CODE
                 if current_room not in rooms:
                     rooms[current_room] = set()
                 rooms[current_room].add(ws)
@@ -74,7 +79,7 @@ async def handler(ws) -> None:
             elif msg_type == "hello":
                 if current_room is None:
                     continue
-                name = unique_player_name(current_room, msg.get("name", "Player"), ws)[:24]
+                name = unique_player_name(current_room, msg.get("name", "Player"), ws)
                 ws.player_name = name
                 await ws.send(json.dumps({"type": "hello_ack", "name": name}))
                 await broadcast_roster(current_room)
