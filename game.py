@@ -669,7 +669,7 @@ class KeplerGame:
             self.local_relay.stop()
             self.local_relay = None
         if code_or_host.upper() == JOIN_CODE:
-            fallback_host = self.default_host if is_browser_runtime() else RELAY_HOST
+            fallback_host = self.default_host if is_browser_runtime() else f"127.0.0.1:{self.default_port}"
             host = discover_host(JOIN_CODE) or fallback_host
         else:
             host = code_or_host
@@ -707,6 +707,21 @@ class KeplerGame:
                 member.color = colors[i]
                 member.joined = False
                 member.ready = False
+
+    def ensure_remote_crew_member(self, name: str) -> CrewMember | None:
+        if not name:
+            return None
+        existing = self.crew_member_by_name(name)
+        if existing is not None:
+            return existing
+
+        for member in self.crew:
+            if not member.joined:
+                member.name = name
+                member.joined = True
+                member.ready = False
+                return member
+        return None
 
     def crew_member_by_name(self, name: str) -> CrewMember | None:
         for member in self.crew:
@@ -758,7 +773,7 @@ class KeplerGame:
                 name = str(message.get("name", ""))
                 if name == self.network.name:
                     continue
-                member = self.crew_member_by_name(name)
+                member = self.ensure_remote_crew_member(name)
                 if member is not None:
                     member.pos = (int(message.get("x", member.pos[0])), int(message.get("y", member.pos[1])))
                     member.joined = True
@@ -1532,12 +1547,13 @@ class KeplerGame:
         if self.menu_active:
             return
         self.apply_network_messages()
-        self.sync_local_player_position(dt)
         self.update_multiplayer(dt)
         if self.screen_state == "ship":
             self.update_ship(dt)
+            self.sync_local_player_position(dt)
             self.transition_timer = max(0.0, self.transition_timer - dt)
             return
+        self.sync_local_player_position(dt)
         if not self.paused:
             self.t = (self.t + dt * 0.035) % 1.0
         self.transition_timer = max(0.0, self.transition_timer - dt)

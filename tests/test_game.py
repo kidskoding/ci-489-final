@@ -86,7 +86,7 @@ def test_discover_host_returns_advertised_relay_port(monkeypatch):
     assert discover_host(JOIN_CODE) == "192.168.1.44:3107"
 
 
-def test_join_code_uses_render_relay_when_discovery_unavailable(monkeypatch):
+def test_local_join_code_falls_back_to_localhost_when_discovery_unavailable(monkeypatch):
     import game as game_module
 
     monkeypatch.setattr(game_module, "discover_host", lambda join_code: None)
@@ -96,8 +96,25 @@ def test_join_code_uses_render_relay_when_discovery_unavailable(monkeypatch):
 
     game.start_join_game()
 
-    assert game.network.host == RELAY_HOST
+    assert game.network.host == "127.0.0.1:3000"
     assert game.menu_active is False
+
+    game.network.close()
+    pygame.quit()
+
+
+def test_browser_join_code_uses_configured_relay_when_discovery_unavailable(monkeypatch):
+    import game as game_module
+
+    monkeypatch.setattr(game_module, "is_browser_runtime", lambda: True)
+    monkeypatch.setattr(game_module, "discover_host", lambda join_code: None)
+    game = KeplerGame(multiplayer_mode="solo", host=RELAY_HOST, port=3000)
+    game.join_ip = JOIN_CODE
+    game.player_name_input = "Visitor"
+
+    game.start_join_game()
+
+    assert game.network.host == RELAY_HOST
 
     game.network.close()
     pygame.quit()
@@ -144,6 +161,37 @@ def test_network_session_applies_server_assigned_unique_name():
     assert session.name == "Player 2"
 
     session.close()
+
+
+def test_player_position_message_creates_remote_member_before_roster():
+    game = KeplerGame(multiplayer_mode="solo")
+    game.network.mode = "host"
+    game.network.name = "Host"
+    game.network.inbox.put({"type": "player_pos", "name": "Visitor", "x": 412, "y": 233})
+
+    game.apply_network_messages()
+
+    visitor = game.crew_member_by_name("Visitor")
+    assert visitor is not None
+    assert visitor.joined is True
+    assert visitor.pos == (412, 233)
+
+    pygame.quit()
+
+
+def test_sync_local_player_position_sends_current_network_name():
+    game = KeplerGame(multiplayer_mode="solo")
+    sent = []
+    game.network.mode = "join"
+    game.network.name = "Visitor 2"
+    game.network.send = sent.append
+    game.player.update(500, 260)
+
+    game.sync_local_player_position(0.1)
+
+    assert sent == [{"type": "player_pos", "name": "Visitor 2", "x": 500, "y": 260}]
+
+    pygame.quit()
 
 def test_law_modes_track_learning_progress():
     game = KeplerGame(multiplayer_mode="solo")

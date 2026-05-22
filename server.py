@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import http
 import json
+import os
 import socket
 import threading
 
 import websockets
 
 HOST = "0.0.0.0"
-PORT = 3000
+PORT = int(os.environ.get("PORT", 3000))
 DISCOVERY_PORT = 48901
 JOIN_CODE = "CI-489-DEMO"
 
@@ -120,9 +122,15 @@ def run_discovery() -> None:
         sock.close()
 
 
+async def health_check(connection, request):
+    if request.path == "/healthz":
+        return connection.respond(http.HTTPStatus.OK, '{"ok":true}')
+    return None
+
+
 async def main() -> None:
     threading.Thread(target=run_discovery, daemon=True).start()
-    async with websockets.serve(handler, HOST, PORT):
+    async with websockets.serve(handler, HOST, PORT, process_request=health_check):
         print(f"Kepler relay server running on ws://{HOST}:{PORT}")
         await asyncio.Future()
 
